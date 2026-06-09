@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.pytest_cache/
+
+# Generated figures (reproduce with `fragmetrics.cli run --out`)
+demo_figures/
+real_figures/
+figures/
+
+# C build artifacts
+shim/*.o
+shim/*.so
+shim/*.dylib
+shim/build/

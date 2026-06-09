@@ -1,0 +1,42 @@
+[project]
+name = "fragmetrics"
+version = "0.1.0"
+description = "Metrics and visualizations for external memory fragmentation"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26", "matplotlib>=3.8", "seaborn>=0.13", "pydantic>=2.5"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["fragmetrics*"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_any_unimported = true
+no_implicit_reexport = true
+# third-party libs without stubs
+[[tool.mypy.overrides]]
+module = ["seaborn.*", "matplotlib.*"]
+ignore_missing_imports = true
+
+[tool.pyright]
+include = ["fragmetrics", "tests"]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+# matplotlib/seaborn ship no complete type stubs; these rules fire on their
+# untyped surface, not on our logic (which mypy + the remaining strict rules
+# still fully check). Disabling only the "unknown from untyped dep" family.
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+reportUnknownParameterType = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
