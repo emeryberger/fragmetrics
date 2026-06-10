@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -e ".[dev]" || pip install -e . && pip install pytest numpy matplotlib seaborn pydantic
+
+      - name: Install mimalloc and jemalloc (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmimalloc-dev libjemalloc-dev cmake
+
+      - name: Install mimalloc and jemalloc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install mimalloc jemalloc cmake
+
+      - name: Build C shims (make)
+        run: cd shim && make
+
+      - name: Build alloc8 tracer (cmake)
+        run: |
+          cd shim
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Run unit tests
+        run: pytest tests/ -v --ignore=tests/test_shim_integration.py
+
+      - name: Run shim integration tests (system + mimalloc + jemalloc + alloc8)
+        run: pytest tests/test_shim_integration.py -v
+
+      - name: Type check (mypy)
+        run: |
+          pip install mypy
+          mypy fragmetrics tests
+
+      - name: Type check (pyright)
+        run: |
+          pip install pyright
+          pyright
