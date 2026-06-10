@@ -29,13 +29,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libmimalloc-dev libmimalloc2 libjemalloc-dev libjemalloc2 cmake
-          # debug: show where the .so files actually are
-          echo "=== mimalloc libs ==="
-          find /usr -name "libmimalloc*" -type f 2>/dev/null || true
+          sudo apt-get install -y libmimalloc-dev libjemalloc-dev cmake
+          # show where the .so files are so we can debug path issues
+          echo "=== mimalloc ==="
+          find /usr -name "libmimalloc*" 2>/dev/null || true
           ldconfig -p | grep mimalloc || true
-          echo "=== jemalloc libs ==="
-          find /usr -name "libjemalloc*" -type f 2>/dev/null || true
+          echo "=== jemalloc ==="
+          find /usr -name "libjemalloc*" 2>/dev/null || true
           ldconfig -p | grep jemalloc || true
 
       - name: Install mimalloc and jemalloc (macOS)
