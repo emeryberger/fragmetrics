@@ -88,9 +88,9 @@ FRAGTRACE_OUT=trace.jsonl FRAGTRACE_BACKEND=jemalloc \
   DYLD_INSERT_LIBRARIES=/opt/homebrew/lib/libjemalloc.dylib:./libfragtrace_backend.dylib \
   ./my_program
 
-# Linux (LD_PRELOAD — allocator first, tracer last)
+# Linux (LD_PRELOAD — tracer FIRST so it wins malloc, allocator after for its symbols)
 FRAGTRACE_OUT=trace.jsonl FRAGTRACE_BACKEND=mimalloc \
-  LD_PRELOAD="/usr/lib/libmimalloc.so:./libfragtrace_backend.so" \
+  LD_PRELOAD="./libfragtrace_backend.so:/usr/lib/libmimalloc.so" \
   ./my_program
 ```
 

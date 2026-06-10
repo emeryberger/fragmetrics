@@ -126,9 +126,9 @@ FRAGTRACE_BACKEND=system FRAGTRACE_OUT=sys_trace.jsonl \
   DYLD_INSERT_LIBRARIES=./libfragtrace_backend.dylib \
   ./my_program
 
-# Linux (same pattern, LD_PRELOAD)
+# Linux (LD_PRELOAD — tracer FIRST so it wins malloc, allocator after for its symbols)
 FRAGTRACE_BACKEND=mimalloc FRAGTRACE_OUT=mi_trace.jsonl \
-  LD_PRELOAD="/usr/lib/libmimalloc.so:./libfragtrace_backend.so" \
+  LD_PRELOAD="./libfragtrace_backend.so:/usr/lib/libmimalloc.so" \
   ./my_program
 ```
 

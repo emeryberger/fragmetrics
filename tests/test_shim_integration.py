@@ -25,7 +25,7 @@ IS_LINUX = platform.system() == "Linux"
 
 
 def _find_lib(name: str) -> Path | None:
-    """Find a shared library by common paths."""
+    """Find a shared library by common paths and ldconfig."""
     candidates: list[Path] = []
     if IS_MACOS:
         brew = Path("/opt/homebrew/lib")
@@ -35,17 +35,41 @@ def _find_lib(name: str) -> Path | None:
             usr_local / f"lib{name}.dylib",
         ]
     elif IS_LINUX:
-        for d in ("/usr/lib", "/usr/lib/x86_64-linux-gnu", "/usr/local/lib"):
-            candidates.append(Path(d) / f"lib{name}.so")
-            # mimalloc often installs as libmimalloc.so.X
+        # search common directories + architecture-specific paths
+        lib_dirs = [
+            Path("/usr/lib"),
+            Path("/usr/lib/x86_64-linux-gnu"),
+            Path("/usr/lib/aarch64-linux-gnu"),
+            Path("/usr/local/lib"),
+            Path("/usr/local/lib/x86_64-linux-gnu"),
+        ]
+        for d in lib_dirs:
+            if not d.exists():
+                continue
+            # exact match
+            candidates.append(d / f"lib{name}.so")
+            # versioned (.so.X, .so.X.Y)
+            for f in sorted(d.glob(f"lib{name}.so*"), reverse=True):
+                candidates.append(f)
+            # mimalloc installs as libmimalloc.so.X.Y on some distros
             if name == "mimalloc":
-                for f in Path(d).glob("libmimalloc.so*"):
+                for f in sorted(d.glob("libmimalloc*.so*"), reverse=True):
                     candidates.append(f)
-            if name == "jemalloc":
-                for f in Path(d).glob("libjemalloc.so*"):
-                    candidates.append(f)
+        # last resort: ask ldconfig
+        try:
+            out = subprocess.run(
+                ["ldconfig", "-p"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in out.stdout.splitlines():
+                if f"lib{name}.so" in line:
+                    parts = line.strip().split("=>")
+                    if len(parts) == 2:
+                        candidates.append(Path(parts[1].strip()))
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
     for p in candidates:
-        if p.exists():
+        if p.exists() and p.is_file():
             return p
     return None
 
@@ -57,10 +81,11 @@ JEMALLOC_LIB = _find_lib("jemalloc")
 @pytest.fixture(scope="session")
 def shim_libs() -> dict[str, Path]:
     """Build the C shims and return paths to the built libraries."""
-    result = subprocess.run(
+    subprocess.run(
         ["make", "clean"],
         cwd=SHIM_DIR,
         capture_output=True,
+        text=True,
     )
     result = subprocess.run(
         ["make"],
@@ -127,17 +152,18 @@ def _run_with_backend(
     env["FRAGTRACE_BACKEND"] = backend
 
     if IS_MACOS:
-        # allocator first, tracer last (dyld load order)
+        # macOS: allocator first, tracer LAST (dyld processes in order; last wins outermost)
         libs = []
         if allocator_lib:
             libs.append(str(allocator_lib))
         libs.append(str(tracer))
         env["DYLD_INSERT_LIBRARIES"] = ":".join(libs)
     else:
-        libs = []
+        # Linux: tracer FIRST (LD_PRELOAD first lib wins symbol resolution for malloc),
+        # allocator after (its mi_malloc/mallocx symbols are still globally visible for dlsym)
+        libs = [str(tracer)]
         if allocator_lib:
             libs.append(str(allocator_lib))
-        libs.append(str(tracer))
         env["LD_PRELOAD"] = ":".join(libs)
 
     result = subprocess.run(
