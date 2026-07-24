@@ -226,6 +226,28 @@ This answers "how good is policy X vs the theoretical best, on this workload?"
 without implementing X. (`--fraggle` finds the binary via the flag, `$FRAGGLE`,
 `PATH`, or a sibling `../idealloc` checkout; omit it for a policies-only table.)
 
+### Two views of a PyTorch snapshot
+
+A memory snapshot can be looked at two ways, and they answer different questions.
+Pass both to `compare` (as `label=path`) to see them side by side:
+
+```bash
+python -m fragmetrics.cli compare \
+    --trace allocs=llama3_allocs.jsonl \
+    --trace segments=llama3_segments.jsonl \
+    --fraggle /path/to/fraggle
+```
+
+- **allocs** — individual tensor placements. A wide spread here (first-fit +9%,
+  worst-fit +265% on Llama3 8B FSDP) shows how much the *placement* of tensors
+  matters. This is an upper bound on placement waste.
+- **segments** — the memory the allocator reserved from the driver (the footprint
+  that actually costs GPU memory). On real snapshots this has few, coarse objects,
+  so most policies tie — the honest, conservative "recoverable memory" number.
+
+The printed legend spells this out, so the distinction is in the output, not a
+footnote.
+
 ### Custom policies
 
 Drop in an arbitrary placement heuristic — a function returning which free run to

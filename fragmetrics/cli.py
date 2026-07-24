@@ -158,42 +158,58 @@ def _fraggle_optimal(trace_path: str, fraggle: str | None) -> dict | None:
     return res or None
 
 
-def _cmd_compare(args: argparse.Namespace) -> int:
-    """One report placing every rung on the same trace:
-    max-load floor  ->  idealloc optimal  ->  each policy  ->  (oracle compaction).
-    """
-    events = _load_events(args)
-    # Policies decide layout, so drop any addresses the trace carried.
-    events = _strip_addresses(events)
-    policies: list[str] = list(args.policy) or [
-        "first-fit", "best-fit", "worst-fit", "next-fit", "buddy", "caching", "oracle",
-    ]
-
-    # Per-policy achieved footprint (peak reserved capacity). Each entry is
-    # (rung name, footprint bytes).
+def _spectrum_for_trace(
+    trace_path: str, policies: list[str], fraggle: str | None
+) -> tuple[list[tuple[str, int]], int]:
+    """Compute (spectrum, peak_live) for one trace file: every policy's footprint
+    plus the idealloc optimal and max-load floor from fraggle. Spectrum entries
+    are (rung name, footprint bytes), sorted small -> large."""
+    events = _strip_addresses(list(read_trace(trace_path)))
     spectrum: list[tuple[str, int]] = []
     peak_live = 0
     for p in policies:
         _snap, heap = list(replay(list(events), p))[-1]
         spectrum.append((p, int(heap.peak_capacity)))
         peak_live = int(heap.peak_live)
-
-    # idealloc optimal + max-load floor (only meaningful for a real trace file).
-    opt = _fraggle_optimal(args.trace, args.fraggle) if args.trace else None
+    opt = _fraggle_optimal(trace_path, fraggle)
     if opt and "max_load" in opt:
         spectrum.append(("max-load (floor)", int(opt["max_load"])))
     if opt and "achievable" in opt:
         spectrum.append(("idealloc (optimal)", int(opt["achievable"])))
-
     spectrum.sort(key=lambda r: r[1])
+    return spectrum, peak_live
 
-    # Report: JSON to stdout, a readable table to stderr.
-    json.dump(
-        {"peak_live": peak_live,
-         "spectrum": [{"rung": name, "footprint": fp} for name, fp in spectrum]},
-        sys.stdout, indent=2,
-    )
-    sys.stdout.write("\n")
+
+def _split_label(spec: str) -> tuple[str, str]:
+    """Parse a `--trace` argument, which may be `label=path` or just `path`."""
+    if "=" in spec and not spec.split("=", 1)[0].endswith(("/", ".")):
+        label, path = spec.split("=", 1)
+        return label, path
+    # default label = filename stem
+    return Path(spec).stem, spec
+
+
+def _cmd_compare(args: argparse.Namespace) -> int:
+    """Footprint spectrum per trace: max-load floor -> idealloc optimal ->
+    each policy -> oracle compaction. Pass multiple --trace label=path to see,
+    e.g., a snapshot's allocs-level and segments-level views side by side."""
+    policies: list[str] = list(args.policy) or [
+        "first-fit", "best-fit", "worst-fit", "next-fit", "buddy", "caching", "oracle",
+    ]
+    if args.synthetic:
+        # synthetic: single unlabelled trace, materialise to a temp file for fraggle
+        import tempfile
+        events = _load_events(args)
+        tf = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+        for e in events:
+            row = {"ts": e.ts, "op": e.op.value, "id": e.id}
+            if e.size is not None:
+                row["size"] = e.size
+            tf.write(json.dumps(row) + "\n")
+        tf.close()
+        traces = [("synthetic", tf.name)]
+    else:
+        traces = [_split_label(t) for t in args.trace]
 
     def _h(b: int) -> str:
         for unit, div in (("GiB", 1024**3), ("MiB", 1024**2), ("KiB", 1024), ("B", 1)):
@@ -201,12 +217,33 @@ def _cmd_compare(args: argparse.Namespace) -> int:
                 return f"{b/div:.2f} {unit}"
         return f"{b} B"
 
-    base = spectrum[0][1] if spectrum else 0
-    sys.stderr.write("\n  rung                      footprint       vs best\n")
-    sys.stderr.write("  " + "-" * 52 + "\n")
-    for name, fp in spectrum:
-        over = f"+{100*(fp-base)/base:.1f}%" if base else "-"
-        sys.stderr.write(f"  {name:24s}  {_h(fp):>12s}   {over:>8s}\n")
+    report_json: dict[str, object] = {}
+    for label, path in traces:
+        spectrum, peak_live = _spectrum_for_trace(path, policies, args.fraggle)
+        report_json[label] = {
+            "peak_live": peak_live,
+            "spectrum": [{"rung": n, "footprint": fp} for n, fp in spectrum],
+        }
+        base = spectrum[0][1] if spectrum else 0
+        sys.stderr.write(f"\n=== {label} ===\n")
+        sys.stderr.write("  rung                      footprint       vs best\n")
+        sys.stderr.write("  " + "-" * 52 + "\n")
+        for name, fp in spectrum:
+            over = f"+{100*(fp-base)/base:.1f}%" if base else "-"
+            sys.stderr.write(f"  {name:24s}  {_h(fp):>12s}   {over:>8s}\n")
+
+    # A plain-English legend so the two levels aren't a mystery.
+    if len(traces) > 1:
+        sys.stderr.write(
+            "\n  legend: each block is one view of the workload. For a PyTorch\n"
+            "  snapshot, 'allocs' = individual tensor placement (upper bound on\n"
+            "  placement waste); 'segments' = memory reserved from the driver (the\n"
+            "  footprint that actually costs you). idealloc(optimal) is the best\n"
+            "  a non-moving allocator could do; oracle allows moving/compaction.\n"
+        )
+
+    json.dump(report_json, sys.stdout, indent=2)
+    sys.stdout.write("\n")
     return 0
 
 
@@ -277,11 +314,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     cmp = sub.add_parser(
         "compare",
-        help="unified footprint spectrum: max-load floor -> idealloc optimal -> "
-             "each policy (pseudo-allocators) on one trace",
+        help="footprint spectrum (max-load floor -> idealloc optimal -> each "
+             "policy) per trace; pass several --trace label=path for side-by-side",
     )
     csrc = cmp.add_mutually_exclusive_group(required=True)
-    csrc.add_argument("--trace", type=str, help="path to a JSONL/CSV trace")
+    csrc.add_argument("--trace", action="append", default=[],
+                      help="trace to compare, as label=path or path (repeatable; "
+                           "e.g. allocs=a.jsonl segments=s.jsonl for both views)")
     csrc.add_argument("--synthetic", type=str, help="fixture name or 'random'")
     cmp.add_argument("--policy", action="append", default=[],
                      help="policy to simulate (repeatable; default: a standard set)")
