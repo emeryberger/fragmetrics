@@ -203,6 +203,11 @@ class Heap:
             free_runs=list(self._free),
         )
 
+    def allocated_bytes(self) -> int:
+        """Sum of live rounded footprints (== live_bytes unless a policy rounds).
+        The gap allocated_bytes - live_bytes is internal fragmentation."""
+        return sum(footprint for _start, footprint, _demand in self._live.values())
+
     # ---- placement strategies --------------------------------------------
 
     def _alloc_fit(self, size: int) -> int:
@@ -467,7 +472,7 @@ class CachingHeap(Heap):
                         free_runs=free)
 
 
-def make_heap(policy: str, **kwargs) -> Heap:
+def make_heap(policy: str, **kwargs: int) -> Heap:
     """Construct the right Heap subclass for `policy`."""
     if policy == "caching":
         return CachingHeap(**kwargs)

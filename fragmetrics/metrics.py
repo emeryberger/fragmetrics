@@ -366,8 +366,8 @@ def doc_metrics(heap: Heap, snap: Snapshot) -> DocMetrics:
     'cached' within that reserved region."""
     active = int(heap.live_bytes)
     # allocated = sum of live rounded footprints (== active unless a policy rounds)
-    allocated = int(sum(fp for _start, fp, _dem in heap._live.values()))  # noqa: SLF001
-    caching = hasattr(heap, "segments") and getattr(heap, "peak_reserved", 0)
+    allocated = int(heap.allocated_bytes())
+    caching = hasattr(heap, "segments") and bool(getattr(heap, "peak_reserved", 0))
     if caching:
         reserved = int(heap.peak_reserved)          # type: ignore[attr-defined]
         segments = int(heap.segments)               # type: ignore[attr-defined]
@@ -383,7 +383,7 @@ def doc_metrics(heap: Heap, snap: Snapshot) -> DocMetrics:
     total_free = max(0, reserved - active)
     external_frag = max(0, total_free - largest_free - cached_free)
     internal_frag = max(0, allocated - active)
-    span = _address_span(heap, snap)
+    span = _address_span(heap)
     density = reserved / span if span else 1.0
     utilization = active / reserved if reserved else 0.0
     non_reclaimable = max(0, reserved - cached_free)
@@ -399,7 +399,7 @@ def doc_metrics(heap: Heap, snap: Snapshot) -> DocMetrics:
     )
 
 
-def _address_span(heap: Heap, snap: Snapshot) -> int:
+def _address_span(heap: Heap) -> int:
     """First-segment-start to last-segment-end. For these models allocation
     starts at 0 and capacity is the high-water end, so span == reserved
     capacity; kept as its own function to match the doc's wording and allow a

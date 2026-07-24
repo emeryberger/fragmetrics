@@ -100,7 +100,7 @@ def test_next_fit_and_caching_are_valid_placements() -> None:
     and a footprint >= peak live."""
     events = w.generate(w.WorkloadConfig(n_events=3000, seed=7))
     for policy in ("next-fit", "caching"):
-        snap, heap = list(replay(list(events), policy))[-1]
+        _snap, heap = list(replay(list(events), policy))[-1]
         assert heap.peak_capacity >= heap.peak_live, policy
 
 
@@ -122,7 +122,7 @@ def test_custom_policy_plugin() -> None:
     """A registered fit function is selectable by name and drives placement."""
     from fragmetrics.heap import register_policy, FreeRun, FitContext, Heap
 
-    def worst_fit_clone(free_runs, size, ctx):
+    def worst_fit_clone(free_runs: list[FreeRun], size: int, ctx: FitContext) -> int | None:
         best, best_len = None, -1
         for i, r in enumerate(free_runs):
             if r.length >= size and r.length > best_len:

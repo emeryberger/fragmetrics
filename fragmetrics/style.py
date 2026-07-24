@@ -67,12 +67,14 @@ def _renders_to_vector(family: str, generic: BaseFamily) -> bool:
     """
     key = "font.serif" if generic == "serif" else "font.sans-serif"
     keys = ("font.family", key, "mathtext.fontset", "pdf.fonttype", "svg.fonttype")
-    saved = {k: mpl.rcParams[k] for k in keys}
+    # matplotlib's shipped stubs type RcParams with a Literal of known keys, so a
+    # computed str key (`key`) trips [index]/[arg-type] though the access is valid.
+    saved = {k: mpl.rcParams[k] for k in keys}  # type: ignore[index]
     try:
         # rcParams MUST be set before artists are created: matplotlib binds a
         # text artist's font at creation time from the rcParams active then.
         mpl.rcParams["font.family"] = generic
-        mpl.rcParams[key] = [family]
+        mpl.rcParams[key] = [family]  # type: ignore[index]
         mpl.rcParams["mathtext.fontset"] = "stix"
         mpl.rcParams["pdf.fonttype"] = 42
         mpl.rcParams["svg.fonttype"] = "none"
@@ -92,7 +94,7 @@ def _renders_to_vector(family: str, generic: BaseFamily) -> bool:
     except Exception:
         return False
     finally:
-        mpl.rcParams.update(saved)
+        mpl.rcParams.update(saved)  # type: ignore[arg-type]
 
 
 def can_render(family: str, generic: BaseFamily = "serif") -> bool:

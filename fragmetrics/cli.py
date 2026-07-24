@@ -105,7 +105,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def _fraggle_optimal(trace_path: str, fraggle: str | None) -> dict | None:
+def _fraggle_optimal(trace_path: str, fraggle: str | None) -> dict[str, int] | None:
     """Run fraggle on the trace to get the idealloc *optimal* (achievable) and the
     max-load floor. Returns {'max_load': B, 'achievable': B} or None if fraggle
     is unavailable / errored. fraggle is located via --fraggle, $FRAGGLE, PATH, or
