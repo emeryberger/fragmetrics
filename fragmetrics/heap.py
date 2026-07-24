@@ -377,6 +377,13 @@ class CachingHeap(Heap):
         # reserved segments). Reuses Heap's free-run machinery conceptually but
         # kept per-pool so small/large don't fragment each other.
         self._pool_free: dict[str, list[FreeRun]] = {"small": [], "large": []}
+        # doc metrics: count of reserved segments, and peak of (reserved,
+        # allocated-rounded, cached-free) captured at each state so the report
+        # reflects the high-water mark, not just end-of-run.
+        self.segments = 0
+        self.peak_reserved = 0
+        self.peak_allocated = 0  # peak sum of rounded block footprints (live)
+        self._allocated = 0      # current sum of rounded footprints (live)
 
     def _round(self, size: int) -> int:
         """Round a request up to this allocator's block granularity."""
@@ -419,12 +426,16 @@ class CachingHeap(Heap):
             seg = max(seg, demand)
             start = self.capacity
             self._extend_capacity(self.capacity + seg)
+            self.segments += 1
             if seg > demand:  # rest of the segment is cached free
                 runs.append(FreeRun(start + demand, seg - demand))
         # record: footprint == demand (rounded), so internal frag = demand-size
         self._live[obj_id] = (start, demand, size)
         self.live_bytes += size
+        self._allocated += demand
         self.peak_live = max(self.peak_live, self.live_bytes)
+        self.peak_reserved = max(self.peak_reserved, self.capacity)
+        self.peak_allocated = max(self.peak_allocated, self._allocated)
         return start
 
     def free(self, obj_id: int) -> None:
@@ -433,6 +444,7 @@ class CachingHeap(Heap):
             return
         start, footprint, demand_sz = entry
         self.live_bytes -= demand_sz
+        self._allocated -= footprint
         pool = "small" if footprint <= self.small_boundary else "large"
         # return to cache and coalesce with adjacent cached blocks in the pool
         runs = self._pool_free[pool]

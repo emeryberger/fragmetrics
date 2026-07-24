@@ -220,7 +220,7 @@ def _cmd_compare(args: argparse.Namespace) -> int:
     report_json: dict[str, object] = {}
     for label, path in traces:
         spectrum, peak_live = _spectrum_for_trace(path, policies, args.fraggle)
-        report_json[label] = {
+        block: dict[str, object] = {
             "peak_live": peak_live,
             "spectrum": [{"rung": n, "footprint": fp} for n, fp in spectrum],
         }
@@ -231,6 +231,27 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         for name, fp in spectrum:
             over = f"+{100*(fp-base)/base:.1f}%" if base else "-"
             sys.stderr.write(f"  {name:24s}  {_h(fp):>12s}   {over:>8s}\n")
+
+        # torch-native-allocation.md metric family, at peak reserved, per policy.
+        if args.doc_metrics:
+            events = _strip_addresses(list(read_trace(path)))
+            dm_rows: dict[str, object] = {}
+            sys.stderr.write("\n  torch-native metrics (at peak reserved):\n")
+            sys.stderr.write(
+                "  policy        density  util  frag_idx  reserved   "
+                "cached_free  int_frag  segs\n"
+            )
+            sys.stderr.write("  " + "-" * 74 + "\n")
+            for p in policies:
+                dm = m.doc_metrics_at_peak(events, p)
+                dm_rows[p] = dm.model_dump()
+                sys.stderr.write(
+                    f"  {p:12s}  {dm.memory_density:6.3f}  {dm.hbm_utilization:5.3f}  "
+                    f"{dm.fragmentation_idx:8.3f}  {_h(dm.reserved):>9s}  "
+                    f"{_h(dm.cached_free):>10s}  {_h(dm.internal_frag):>8s}  {dm.segments:4d}\n"
+                )
+            block["doc_metrics"] = dm_rows
+        report_json[label] = block
 
     # A plain-English legend so the two levels aren't a mystery.
     if len(traces) > 1:
@@ -326,6 +347,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="policy to simulate (repeatable; default: a standard set)")
     cmp.add_argument("--fraggle", type=str,
                      help="path to the fraggle binary (for the idealloc-optimal rung)")
+    cmp.add_argument("--doc-metrics", action="store_true",
+                     help="also report the torch-native-allocation.md metric family "
+                          "(density, utilization, fragmentation index, reserved, "
+                          "cached-free, internal frag, segments) per policy, at peak")
     cmp.add_argument("--n-events", type=int, default=10_000, help="events for --synthetic random")
     cmp.add_argument("--seed", type=int, default=0, help="seed for --synthetic random")
     cmp.set_defaults(func=_cmd_compare)

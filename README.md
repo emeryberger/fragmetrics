@@ -248,6 +248,37 @@ python -m fragmetrics.cli compare \
 The printed legend spells this out, so the distinction is in the output, not a
 footnote.
 
+### torch-native-allocation.md metrics
+
+Add `--doc-metrics` to report that doc's full metric family per policy, measured
+at peak reserved memory:
+
+```bash
+python -m fragmetrics.cli compare --trace allocs=app.jsonl --doc-metrics
+```
+
+```
+  policy        density  util  frag_idx  reserved   cached_free  int_frag  segs
+  first-fit      1.000  0.229     0.000  13.43 GiB   10.35 GiB       0 B     0
+  caching        1.000  0.214     0.043  14.41 GiB   10.84 GiB  502 MiB     70
+  worst-fit      1.000  0.068     0.000  45.03 GiB   41.95 GiB       0 B     0
+  oracle         1.000  0.250     0.000  12.34 GiB    9.26 GiB       0 B     0
+```
+
+Every metric the doc defines is computed (`fragmetrics.metrics.DocMetrics`):
+**reserved / allocated / active**, **memory density** (reserved/span),
+**HBM utilization** (active/reserved), **internal** and **external
+fragmentation**, **fragmentation index**, **non-reclaimable floor**
+(reserved − cached-free), **cached free**, **largest free**, and **segment
+count** — with the definitional identities enforced by tests.
+
+One honesty note: `density` and `external_frag` are trivial (1.0 / 0) for the
+reference policies because they place segments *contiguously* from address 0, so
+span == reserved. Those two only become meaningful on a real address-resolved
+trace where segments scatter across the VA space. The metrics that discriminate
+the simulated policies are utilization, internal frag, cached free, reserved, and
+segment count — which vary as expected (e.g. worst-fit's util 0.07 vs oracle 0.25).
+
 ### Custom policies
 
 Drop in an arbitrary placement heuristic — a function returning which free run to

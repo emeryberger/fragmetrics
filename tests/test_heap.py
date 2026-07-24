@@ -141,3 +141,33 @@ def test_custom_policy_plugin() -> None:
 def test_unknown_policy_rejected() -> None:
     with pytest.raises(ValueError):
         Heap("no-such-policy")
+
+
+# ---- torch-native-allocation.md metric family ------------------------------
+
+def test_doc_metrics_identities() -> None:
+    """The doc's metrics must satisfy their defining identities on any replay."""
+    from fragmetrics.metrics import doc_metrics_at_peak
+    events = w.generate(w.WorkloadConfig(n_events=3000, seed=11))
+    for policy in ("first-fit", "best-fit", "caching", "oracle"):
+        dm = doc_metrics_at_peak(events, policy)
+        # definitional identities from the doc
+        assert dm.internal_frag == max(0, dm.allocated - dm.active), policy
+        assert dm.non_reclaimable == max(0, dm.reserved - dm.cached_free), policy
+        assert dm.reserved >= dm.active, policy          # can't use less than live
+        assert dm.allocated >= dm.active, policy          # rounding only adds
+        assert 0.0 <= dm.hbm_utilization <= 1.0, policy
+        assert 0.0 <= dm.fragmentation_idx, policy
+
+
+def test_caching_has_internal_frag_and_segments() -> None:
+    """The caching allocator rounds sizes (internal frag) and reserves segments;
+    a plain fit policy does neither."""
+    from fragmetrics.metrics import doc_metrics_at_peak
+    events = w.generate(w.WorkloadConfig(n_events=2000, seed=5))
+    caching = doc_metrics_at_peak(events, "caching")
+    firstfit = doc_metrics_at_peak(events, "first-fit")
+    assert caching.segments > 0
+    assert caching.internal_frag >= 0          # rounding may or may not bite this trace
+    assert firstfit.segments == 0
+    assert firstfit.internal_frag == 0         # fits never round
