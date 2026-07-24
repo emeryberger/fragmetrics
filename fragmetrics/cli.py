@@ -105,6 +105,111 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _fraggle_optimal(trace_path: str, fraggle: str | None) -> dict | None:
+    """Run fraggle on the trace to get the idealloc *optimal* (achievable) and the
+    max-load floor. Returns {'max_load': B, 'achievable': B} or None if fraggle
+    is unavailable / errored. fraggle is located via --fraggle, $FRAGGLE, PATH, or
+    a sibling ../idealloc/target/release/fraggle checkout."""
+    import os
+    import re
+    import shutil
+    import subprocess
+
+    cand = (
+        fraggle
+        or os.environ.get("FRAGGLE")
+        or shutil.which("fraggle")
+        or str(Path(__file__).resolve().parent.parent.parent / "idealloc"
+                / "target" / "release" / "fraggle")
+    )
+    if not cand or not Path(cand).exists():
+        sys.stderr.write(
+            "note: fraggle not found (set --fraggle or $FRAGGLE, or build "
+            "../idealloc); skipping the idealloc-optimal rung.\n"
+        )
+        return None
+    try:
+        out = subprocess.run(
+            [cand, trace_path, "--ignore-addresses"],
+            capture_output=True, text=True, timeout=600,
+        ).stdout
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"note: fraggle run failed ({e}); skipping optimal rung.\n")
+        return None
+
+    # Parse fraggle's human report: "L (max load): <n> <unit>" and "achievable: ..."
+    def _bytes(line: str) -> int | None:
+        mobj = re.search(r"([\d.]+)\s*(B|KiB|MiB|GiB)", line)
+        if not mobj:
+            return None
+        v = float(mobj.group(1))
+        return int(v * {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3}[mobj.group(2)])
+
+    res: dict[str, int] = {}
+    for line in out.splitlines():
+        if "max load" in line:
+            b = _bytes(line)
+            if b is not None:
+                res["max_load"] = b
+        elif "achievable" in line:
+            b = _bytes(line)
+            if b is not None:
+                res["achievable"] = b
+    return res or None
+
+
+def _cmd_compare(args: argparse.Namespace) -> int:
+    """One report placing every rung on the same trace:
+    max-load floor  ->  idealloc optimal  ->  each policy  ->  (oracle compaction).
+    """
+    events = _load_events(args)
+    # Policies decide layout, so drop any addresses the trace carried.
+    events = _strip_addresses(events)
+    policies: list[str] = list(args.policy) or [
+        "first-fit", "best-fit", "worst-fit", "next-fit", "buddy", "caching", "oracle",
+    ]
+
+    # Per-policy achieved footprint (peak reserved capacity). Each entry is
+    # (rung name, footprint bytes).
+    spectrum: list[tuple[str, int]] = []
+    peak_live = 0
+    for p in policies:
+        _snap, heap = list(replay(list(events), p))[-1]
+        spectrum.append((p, int(heap.peak_capacity)))
+        peak_live = int(heap.peak_live)
+
+    # idealloc optimal + max-load floor (only meaningful for a real trace file).
+    opt = _fraggle_optimal(args.trace, args.fraggle) if args.trace else None
+    if opt and "max_load" in opt:
+        spectrum.append(("max-load (floor)", int(opt["max_load"])))
+    if opt and "achievable" in opt:
+        spectrum.append(("idealloc (optimal)", int(opt["achievable"])))
+
+    spectrum.sort(key=lambda r: r[1])
+
+    # Report: JSON to stdout, a readable table to stderr.
+    json.dump(
+        {"peak_live": peak_live,
+         "spectrum": [{"rung": name, "footprint": fp} for name, fp in spectrum]},
+        sys.stdout, indent=2,
+    )
+    sys.stdout.write("\n")
+
+    def _h(b: int) -> str:
+        for unit, div in (("GiB", 1024**3), ("MiB", 1024**2), ("KiB", 1024), ("B", 1)):
+            if b >= div:
+                return f"{b/div:.2f} {unit}"
+        return f"{b} B"
+
+    base = spectrum[0][1] if spectrum else 0
+    sys.stderr.write("\n  rung                      footprint       vs best\n")
+    sys.stderr.write("  " + "-" * 52 + "\n")
+    for name, fp in spectrum:
+        over = f"+{100*(fp-base)/base:.1f}%" if base else "-"
+        sys.stderr.write(f"  {name:24s}  {_h(fp):>12s}   {over:>8s}\n")
+    return 0
+
+
 def _default_tracer() -> Path:
     """Locate the built fragtrace library next to the package's shim/ dir."""
     suffix = "dylib" if collect_mod.is_macos() else "so"
@@ -169,6 +274,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="drop trace addresses so --policy decides layout (allocator comparison)",
     )
     run.set_defaults(func=_cmd_run)
+
+    cmp = sub.add_parser(
+        "compare",
+        help="unified footprint spectrum: max-load floor -> idealloc optimal -> "
+             "each policy (pseudo-allocators) on one trace",
+    )
+    csrc = cmp.add_mutually_exclusive_group(required=True)
+    csrc.add_argument("--trace", type=str, help="path to a JSONL/CSV trace")
+    csrc.add_argument("--synthetic", type=str, help="fixture name or 'random'")
+    cmp.add_argument("--policy", action="append", default=[],
+                     help="policy to simulate (repeatable; default: a standard set)")
+    cmp.add_argument("--fraggle", type=str,
+                     help="path to the fraggle binary (for the idealloc-optimal rung)")
+    cmp.add_argument("--n-events", type=int, default=10_000, help="events for --synthetic random")
+    cmp.add_argument("--seed", type=int, default=0, help="seed for --synthetic random")
+    cmp.set_defaults(func=_cmd_compare)
     return parser
 
 

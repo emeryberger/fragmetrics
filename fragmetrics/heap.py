@@ -32,10 +32,44 @@ regimes, not to reproduce any production allocator byte-for-byte.
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 
 from .trace import Event, Op
+
+# ---------------------------------------------------------------------------
+# Pluggable policies
+# ---------------------------------------------------------------------------
+#
+# A *fit function* is the core placement decision, factored out so new policies
+# are drop-in without touching the Heap internals. Given the current coalesced
+# free-run list and a request size, it returns the INDEX of the run to carve
+# from, or None to force the heap to grow. This is enough to express every
+# classic online fit (first/best/worst/next) and any custom heuristic.
+#
+#   def my_fit(free_runs: list[FreeRun], size: int, ctx: FitContext) -> int | None: ...
+#
+# Register one with `register_policy("name", my_fit)` and it becomes selectable
+# by name everywhere (CLI, replay, Heap). `ctx` carries small mutable per-heap
+# state (e.g. next-fit's rolling cursor) so fit functions can stay pure-ish.
+FitFn = Callable[["list[FreeRun]", int, "FitContext"], "int | None"]
+
+_CUSTOM_POLICIES: dict[str, FitFn] = {}
+
+
+@dataclass
+class FitContext:
+    """Scratch state a fit function may read/update across calls on one heap."""
+    cursor: int = 0  # for next-fit: index to resume scanning from
+
+
+def register_policy(name: str, fit: FitFn) -> None:
+    """Register a custom fit function under `name` (usable as a --policy)."""
+    _CUSTOM_POLICIES[name] = fit
+
+
+def registered_policies() -> tuple[str, ...]:
+    return tuple(_CUSTOM_POLICIES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,13 +111,25 @@ class Snapshot:
 class Heap:
     """A growable contiguous heap with a pluggable placement policy."""
 
-    #: registered policy names
-    POLICIES = ("first-fit", "best-fit", "worst-fit", "segregated-fit", "buddy", "oracle")
+    #: built-in policy names (custom ones registered via register_policy add to these)
+    POLICIES = (
+        "first-fit", "best-fit", "worst-fit", "next-fit",
+        "segregated-fit", "buddy", "caching", "oracle",
+    )
+
+    @classmethod
+    def known_policies(cls) -> tuple[str, ...]:
+        return cls.POLICIES + registered_policies()
 
     def __init__(self, policy: str = "first-fit", *, initial_capacity: int = 0):
-        if policy not in self.POLICIES:
-            raise ValueError(f"unknown policy {policy!r}; choose from {self.POLICIES}")
+        if policy not in self.known_policies():
+            raise ValueError(
+                f"unknown policy {policy!r}; choose from {self.known_policies()}"
+            )
         self.policy = policy
+        self._fit_ctx = FitContext()
+        # A custom fit function shadows the built-in dispatch when registered.
+        self._custom_fit = _CUSTOM_POLICIES.get(policy)
         self.capacity = initial_capacity
         # free runs, sorted by start, always coalesced
         self._free: list[FreeRun] = [FreeRun(0, initial_capacity)] if initial_capacity else []
@@ -160,11 +206,25 @@ class Heap:
     # ---- placement strategies --------------------------------------------
 
     def _alloc_fit(self, size: int) -> int:
-        """first/best/worst fit over the coalesced free-run list."""
-        chosen = -1
-        if self.policy == "first-fit":
+        """first/best/worst/next fit -- or a registered custom fit -- over the
+        coalesced free-run list. Returns the carved start address."""
+        if self._custom_fit is not None:
+            chosen = self._custom_fit(self._free, size, self._fit_ctx)
+            chosen = -1 if chosen is None else chosen
+        elif self.policy == "first-fit":
+            chosen = -1
             for i, r in enumerate(self._free):
                 if r.length >= size:
+                    chosen = i
+                    break
+        elif self.policy == "next-fit":
+            # Resume scanning from the last-used run (rolling cursor), wrapping
+            # around once. Approximates a real bump-cursor allocator.
+            chosen = -1
+            n = len(self._free)
+            for off in range(n):
+                i = (self._fit_ctx.cursor + off) % n
+                if self._free[i].length >= size:
                     chosen = i
                     break
         else:
@@ -179,7 +239,11 @@ class Heap:
             chosen = best_idx
         if chosen < 0:
             return self._grow_and_place(size)
-        return self._carve(chosen, size)
+        start = self._carve(chosen, size)
+        if self.policy == "next-fit":
+            # Keep the cursor valid after the carve (run may have been removed).
+            self._fit_ctx.cursor = chosen % max(1, len(self._free))
+        return start
 
     def _alloc_buddy(self, size: int) -> tuple[int, int]:
         """Buddy-style: round the request up to a power of two and allocate that
@@ -270,6 +334,134 @@ class Heap:
         self._free.insert(i, FreeRun(start, length))
 
 
+class CachingHeap(Heap):
+    """A caching / segment-bucketing allocator, modelling the PyTorch-CUDA style
+    (and the block-segment scheme in torch-native-allocation.md).
+
+    Unlike the reference fits, this heap distinguishes *reserved* memory (whole
+    segments obtained from the "driver" and cached, never returned) from *live*
+    blocks inside them. Allocation:
+
+      1. Round the request up (min size + power-of-two-ish rounding) -> `demand`.
+      2. Route to the small pool (<= boundary) or large pool.
+      3. Find a cached free block that fits (best-fit within the pool); split it
+         if the remainder is worth keeping. If none, reserve a NEW segment (a
+         fixed segment size for the small pool; rounded request for the large
+         pool) from the growing address space and carve from it.
+      4. free() returns the block to the pool's cache (coalescing with adjacent
+         free blocks in the same segment) -- it does NOT shrink reserved memory.
+
+    The heap's `peak_capacity` therefore tracks *reserved* bytes (segments held),
+    which is exactly the "reserved" side of the doc's `density = reserved / span`.
+    Parameters default to the doc's derived values but are tunable.
+    """
+
+    def __init__(
+        self,
+        *,
+        small_boundary: int = 256 * 1024,      # small/large pool split
+        small_segment: int = 2 * 1024 * 1024,  # one segment covers the small pool
+        large_roundup: int = 2 * 1024 * 1024,  # large allocs rounded to this
+        min_block: int = 256,                  # smallest rounded size
+        pow2_divisions: int = 2,               # roundup granularity within a power of two
+        initial_capacity: int = 0,
+    ):
+        super().__init__(policy="first-fit", initial_capacity=initial_capacity)
+        self.policy = "caching"
+        self.small_boundary = small_boundary
+        self.small_segment = small_segment
+        self.large_roundup = large_roundup
+        self.min_block = min_block
+        self.pow2_divisions = max(1, pow2_divisions)
+        # cached free blocks per pool: list of FreeRun (address-space runs inside
+        # reserved segments). Reuses Heap's free-run machinery conceptually but
+        # kept per-pool so small/large don't fragment each other.
+        self._pool_free: dict[str, list[FreeRun]] = {"small": [], "large": []}
+
+    def _round(self, size: int) -> int:
+        """Round a request up to this allocator's block granularity."""
+        if size <= self.min_block:
+            return self.min_block
+        if size <= self.small_boundary:
+            # small pool: round up to a multiple of min_block
+            return ((size + self.min_block - 1) // self.min_block) * self.min_block
+        # large pool: round up within a power of two, `pow2_divisions` steps
+        p = 1
+        while p < size:
+            p <<= 1
+        lo = p >> 1
+        step = max(self.large_roundup, (p - lo) // self.pow2_divisions)
+        return min(p, lo + ((size - lo + step - 1) // step) * step)
+
+    def alloc(self, obj_id: int, size: int, *, addr: int | None = None) -> int:
+        # `addr` (an address-resolved trace's placement) is intentionally ignored:
+        # a caching allocator always makes its own placement decision, which is
+        # the whole point of simulating it. We model its choices, not the trace's.
+        del addr
+        if obj_id in self._live:
+            raise ValueError(f"alloc of already-live id {obj_id}")
+        demand = self._round(size)
+        pool = "small" if demand <= self.small_boundary else "large"
+        runs = self._pool_free[pool]
+        # best-fit within the pool's cached free blocks
+        best = -1
+        for i, r in enumerate(runs):
+            if r.length >= demand and (best < 0 or r.length < runs[best].length):
+                best = i
+        if best >= 0:
+            r = runs.pop(best)
+            start = r.start
+            if r.length > demand:  # split; keep remainder cached
+                runs.append(FreeRun(start + demand, r.length - demand))
+        else:
+            # reserve a new segment from the top of the address space
+            seg = self.small_segment if pool == "small" else max(demand, self.large_roundup)
+            seg = max(seg, demand)
+            start = self.capacity
+            self._extend_capacity(self.capacity + seg)
+            if seg > demand:  # rest of the segment is cached free
+                runs.append(FreeRun(start + demand, seg - demand))
+        # record: footprint == demand (rounded), so internal frag = demand-size
+        self._live[obj_id] = (start, demand, size)
+        self.live_bytes += size
+        self.peak_live = max(self.peak_live, self.live_bytes)
+        return start
+
+    def free(self, obj_id: int) -> None:
+        entry = self._live.pop(obj_id, None)
+        if entry is None:
+            return
+        start, footprint, demand_sz = entry
+        self.live_bytes -= demand_sz
+        pool = "small" if footprint <= self.small_boundary else "large"
+        # return to cache and coalesce with adjacent cached blocks in the pool
+        runs = self._pool_free[pool]
+        runs.append(FreeRun(start, footprint))
+        runs.sort(key=lambda r: r.start)
+        merged: list[FreeRun] = []
+        for r in runs:
+            if merged and merged[-1].end == r.start:
+                merged[-1] = FreeRun(merged[-1].start, merged[-1].length + r.length)
+            else:
+                merged.append(r)
+        self._pool_free[pool] = merged
+
+    def snapshot(self, ts: int) -> Snapshot:
+        free = sorted(
+            self._pool_free["small"] + self._pool_free["large"],
+            key=lambda r: r.start,
+        )
+        return Snapshot(ts=ts, capacity=self.capacity, live_bytes=self.live_bytes,
+                        free_runs=free)
+
+
+def make_heap(policy: str, **kwargs) -> Heap:
+    """Construct the right Heap subclass for `policy`."""
+    if policy == "caching":
+        return CachingHeap(**kwargs)
+    return Heap(policy, **kwargs)
+
+
 def replay(
     events: Iterable[Event],
     policy: str = "first-fit",
@@ -281,7 +473,7 @@ def replay(
     ``snapshot_every`` controls sampling: 1 = every event (full time series),
     larger = coarser/cheaper. The final state is always emitted.
     """
-    heap = Heap(policy)
+    heap = make_heap(policy)
     last_ts: int | None = None
     for n, ev in enumerate(events):
         heap.apply(ev)

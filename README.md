@@ -194,6 +194,60 @@ FRAGTRACE_OUT=trace.jsonl \
 
 ---
 
+## Simulating policies as pseudo-allocators
+
+Any placement policy can be *replayed* over a real trace to see the footprint it
+would produce — no need to build and run the allocator for real. Built-in
+policies: `first-fit`, `best-fit`, `worst-fit`, `next-fit`, `segregated-fit`,
+`buddy`, `caching` (PyTorch-style size-class segment bucketing), and `oracle`
+(perfect compaction — the moving lower bound).
+
+The `compare` subcommand places every rung on one trace and, if a `fraggle`
+binary is available, adds the **idealloc optimal** (the best *non-moving* static
+placement) and the **max-load floor**:
+
+```bash
+python -m fragmetrics.cli compare --trace app.jsonl --fraggle /path/to/fraggle
+```
+
+```
+  rung                      footprint       vs best
+  ----------------------------------------------------
+  oracle                       85.20 MiB      +0.0%   # compaction (moving) floor
+  idealloc (optimal)           85.20 MiB      +0.0%   # best non-moving static plan
+  best-fit                     85.39 MiB      +0.2%
+  first-fit                    86.43 MiB      +1.4%
+  caching                      88.00 MiB      +3.3%
+  next-fit                    105.29 MiB     +23.6%
+  worst-fit                   137.89 MiB     +61.9%
+```
+
+This answers "how good is policy X vs the theoretical best, on this workload?"
+without implementing X. (`--fraggle` finds the binary via the flag, `$FRAGGLE`,
+`PATH`, or a sibling `../idealloc` checkout; omit it for a policies-only table.)
+
+### Custom policies
+
+Drop in an arbitrary placement heuristic — a function returning which free run to
+carve — and it becomes selectable by name:
+
+```python
+from fragmetrics.heap import register_policy, replay
+
+def my_fit(free_runs, size, ctx):
+    # return the index of the run to allocate from, or None to grow the heap
+    return next((i for i, r in enumerate(free_runs) if r.length >= size), None)
+
+register_policy("my-fit", my_fit)
+snapshot, heap = list(replay(events, "my-fit"))[-1]
+print(heap.peak_capacity)   # the footprint your policy achieved
+```
+
+The `caching` allocator (size-class pools, block split/merge, segment
+reservation) is tunable via `CachingHeap(small_boundary=…, small_segment=…,
+large_roundup=…, …)` — the defaults match the values derived in
+`torch-native-allocation.md`.
+
 ## Metrics
 
 | | metric | what it captures | function |
