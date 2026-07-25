@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 include = ["fragmetrics*"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 strict = true
 warn_unreachable = true
 warn_redundant_casts = true
@@ -27,7 +27,7 @@ ignore_missing_imports = true
 
 [tool.pyright]
 include = ["fragmetrics", "tests"]
-pythonVersion = "3.11"
+pythonVersion = "3.12"
 typeCheckingMode = "strict"
 reportMissingTypeStubs = false
 # matplotlib/seaborn ship no complete type stubs; these rules fire on their

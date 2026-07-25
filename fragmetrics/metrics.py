@@ -310,3 +310,115 @@ def summarize(snap: Snapshot) -> SnapshotMetrics:
         gini=free_gini(snap),
         entropy=free_entropy(snap),
     )
+
+
+# ---------------------------------------------------------------------------
+# torch-native-allocation.md metric family
+# ---------------------------------------------------------------------------
+#
+# These reproduce the exact definitions in that doc for a caching/segment
+# allocator. They need three quantities the plain Snapshot doesn't carry, so we
+# read them from the Heap after replay:
+#   reserved  = physical memory held (segments)         -> heap.peak_capacity
+#   allocated = rounded/split live block sizes          -> sum of live footprints
+#   active    = requested (user) live sizes             -> heap.live_bytes
+# cached_free (free blocks inside reserved segments) and largest_free come from
+# the snapshot's free runs. For a growable non-segment heap, reserved == capacity
+# and cached_free == total_free (all free space sits inside the reserved region).
+
+class DocMetrics(BaseModel):
+    """The torch-native-allocation.md metric set for one heap state.
+
+    Caveat on `memory_density` / `external_frag`: the simulated policies place
+    segments contiguously from address 0, so the address span equals the reserved
+    bytes and density is always 1.0 (external frag 0). Those two metrics only
+    become non-trivial when segments are *scattered* across the virtual address
+    space, which a real production allocator does but these reference models do
+    not. The metrics that DO discriminate policies here are `hbm_utilization`
+    (active/reserved), `internal_frag` (rounding waste), `cached_free`,
+    `reserved`, and `segments`; density/ext-frag are reported for completeness
+    and match a real allocator only when fed a real address-resolved trace."""
+
+    model_config = ConfigDict(frozen=True)
+
+    reserved: int          # physical memory held (segments)
+    allocated: int         # rounded/split live block sizes
+    active: int            # requested live sizes
+    address_span: int      # first segment start -> last segment end
+    segments: int          # number of reserved segments (0 if not tracked)
+    cached_free: int       # free blocks cached inside reserved segments
+    largest_free: int      # largest contiguous free chunk
+    total_free: int        # reserved - active  (per the doc: over held memory)
+    external_frag: int     # total_free - largest_free - cached_free
+    internal_frag: int     # allocated - active
+    memory_density: float  # reserved / span         (1.0 ideal)
+    hbm_utilization: float # active / reserved
+    non_reclaimable: int   # reserved - cached_free   (the honest cost)
+    fragmentation_idx: float  # (ext + int) / total_free  (0 ideal)
+
+
+def doc_metrics(heap: Heap, snap: Snapshot) -> DocMetrics:
+    """Compute the doc's metric family from a replayed heap + its final snapshot.
+
+    Works for any policy; for the caching allocator `reserved` is the peak
+    segments held and `segments`/`allocated` come from its own counters, while
+    for the reference fits `reserved == capacity` and every free byte is
+    'cached' within that reserved region."""
+    active = int(heap.live_bytes)
+    # allocated = sum of live rounded footprints (== active unless a policy rounds)
+    allocated = int(heap.allocated_bytes())
+    caching = hasattr(heap, "segments") and bool(getattr(heap, "peak_reserved", 0))
+    if caching:
+        reserved = int(heap.peak_reserved)          # type: ignore[attr-defined]
+        segments = int(heap.segments)               # type: ignore[attr-defined]
+    else:
+        reserved = int(heap.peak_capacity)
+        segments = 0
+
+    runs = snap.free_runs
+    largest_free = max((r.length for r in runs), default=0)
+    # cached free = free space sitting inside reserved memory.
+    cached_free = int(sum(r.length for r in runs))
+    # total free over held memory (doc: total_free = reserved - active).
+    total_free = max(0, reserved - active)
+    external_frag = max(0, total_free - largest_free - cached_free)
+    internal_frag = max(0, allocated - active)
+    span = _address_span(heap)
+    density = reserved / span if span else 1.0
+    utilization = active / reserved if reserved else 0.0
+    non_reclaimable = max(0, reserved - cached_free)
+    frag_idx = (external_frag + internal_frag) / total_free if total_free else 0.0
+
+    return DocMetrics(
+        reserved=reserved, allocated=allocated, active=active,
+        address_span=span, segments=segments, cached_free=cached_free,
+        largest_free=largest_free, total_free=total_free,
+        external_frag=external_frag, internal_frag=internal_frag,
+        memory_density=round(density, 4), hbm_utilization=round(utilization, 4),
+        non_reclaimable=non_reclaimable, fragmentation_idx=round(frag_idx, 4),
+    )
+
+
+def _address_span(heap: Heap) -> int:
+    """First-segment-start to last-segment-end. For these models allocation
+    starts at 0 and capacity is the high-water end, so span == reserved
+    capacity; kept as its own function to match the doc's wording and allow a
+    non-zero base later."""
+    return int(heap.peak_capacity)
+
+
+def doc_metrics_at_peak(events: "Sequence[Event]", policy: str = "caching") -> DocMetrics:
+    """Replay `events` under `policy` and return the doc metrics at the moment of
+    PEAK reserved memory -- which is what the doc's "at peak (step0_after_fwd)"
+    numbers mean. Snapshots active/cached_free/allocated consistently at that
+    same instant (not end-of-trace, where most tensors have been freed)."""
+    from .heap import replay  # local import avoids a cycle at module load
+    best_reserved = -1
+    best: DocMetrics | None = None
+    for snap, heap in replay(list(events), policy):
+        reserved = getattr(heap, "peak_reserved", 0) or heap.capacity
+        if reserved >= best_reserved:
+            best_reserved = reserved
+            best = doc_metrics(heap, snap)
+    assert best is not None, "empty event stream"
+    return best

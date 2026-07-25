@@ -194,6 +194,113 @@ FRAGTRACE_OUT=trace.jsonl \
 
 ---
 
+## Simulating policies as pseudo-allocators
+
+Any placement policy can be *replayed* over a real trace to see the footprint it
+would produce — no need to build and run the allocator for real. Built-in
+policies: `first-fit`, `best-fit`, `worst-fit`, `next-fit`, `segregated-fit`,
+`buddy`, `caching` (PyTorch-style size-class segment bucketing), and `oracle`
+(perfect compaction — the moving lower bound).
+
+The `compare` subcommand places every rung on one trace and, if a `fraggle`
+binary is available, adds the **idealloc optimal** (the best *non-moving* static
+placement) and the **max-load floor**:
+
+```bash
+python -m fragmetrics.cli compare --trace app.jsonl --fraggle /path/to/fraggle
+```
+
+```
+  rung                      footprint       vs best
+  ----------------------------------------------------
+  oracle                       85.20 MiB      +0.0%   # compaction (moving) floor
+  idealloc (optimal)           85.20 MiB      +0.0%   # best non-moving static plan
+  best-fit                     85.39 MiB      +0.2%
+  first-fit                    86.43 MiB      +1.4%
+  caching                      88.00 MiB      +3.3%
+  next-fit                    105.29 MiB     +23.6%
+  worst-fit                   137.89 MiB     +61.9%
+```
+
+This answers "how good is policy X vs the theoretical best, on this workload?"
+without implementing X. (`--fraggle` finds the binary via the flag, `$FRAGGLE`,
+`PATH`, or a sibling `../idealloc` checkout; omit it for a policies-only table.)
+
+### Two views of a PyTorch snapshot
+
+A memory snapshot can be looked at two ways, and they answer different questions.
+Pass both to `compare` (as `label=path`) to see them side by side:
+
+```bash
+python -m fragmetrics.cli compare \
+    --trace allocs=llama3_allocs.jsonl \
+    --trace segments=llama3_segments.jsonl \
+    --fraggle /path/to/fraggle
+```
+
+- **allocs** — individual tensor placements. A wide spread here (first-fit +9%,
+  worst-fit +265% on Llama3 8B FSDP) shows how much the *placement* of tensors
+  matters. This is an upper bound on placement waste.
+- **segments** — the memory the allocator reserved from the driver (the footprint
+  that actually costs GPU memory). On real snapshots this has few, coarse objects,
+  so most policies tie — the honest, conservative "recoverable memory" number.
+
+The printed legend spells this out, so the distinction is in the output, not a
+footnote.
+
+### torch-native-allocation.md metrics
+
+Add `--doc-metrics` to report that doc's full metric family per policy, measured
+at peak reserved memory:
+
+```bash
+python -m fragmetrics.cli compare --trace allocs=app.jsonl --doc-metrics
+```
+
+```
+  policy        density  util  frag_idx  reserved   cached_free  int_frag  segs
+  first-fit      1.000  0.229     0.000  13.43 GiB   10.35 GiB       0 B     0
+  caching        1.000  0.214     0.043  14.41 GiB   10.84 GiB  502 MiB     70
+  worst-fit      1.000  0.068     0.000  45.03 GiB   41.95 GiB       0 B     0
+  oracle         1.000  0.250     0.000  12.34 GiB    9.26 GiB       0 B     0
+```
+
+Every metric the doc defines is computed (`fragmetrics.metrics.DocMetrics`):
+**reserved / allocated / active**, **memory density** (reserved/span),
+**HBM utilization** (active/reserved), **internal** and **external
+fragmentation**, **fragmentation index**, **non-reclaimable floor**
+(reserved − cached-free), **cached free**, **largest free**, and **segment
+count** — with the definitional identities enforced by tests.
+
+One honesty note: `density` and `external_frag` are trivial (1.0 / 0) for the
+reference policies because they place segments *contiguously* from address 0, so
+span == reserved. Those two only become meaningful on a real address-resolved
+trace where segments scatter across the VA space. The metrics that discriminate
+the simulated policies are utilization, internal frag, cached free, reserved, and
+segment count — which vary as expected (e.g. worst-fit's util 0.07 vs oracle 0.25).
+
+### Custom policies
+
+Drop in an arbitrary placement heuristic — a function returning which free run to
+carve — and it becomes selectable by name:
+
+```python
+from fragmetrics.heap import register_policy, replay
+
+def my_fit(free_runs, size, ctx):
+    # return the index of the run to allocate from, or None to grow the heap
+    return next((i for i, r in enumerate(free_runs) if r.length >= size), None)
+
+register_policy("my-fit", my_fit)
+snapshot, heap = list(replay(events, "my-fit"))[-1]
+print(heap.peak_capacity)   # the footprint your policy achieved
+```
+
+The `caching` allocator (size-class pools, block split/merge, segment
+reservation) is tunable via `CachingHeap(small_boundary=…, small_segment=…,
+large_roundup=…, …)` — the defaults match the values derived in
+`torch-native-allocation.md`.
+
 ## Metrics
 
 | | metric | what it captures | function |

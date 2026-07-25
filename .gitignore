@@ -16,3 +16,4 @@ shim/*.o
 shim/*.so
 shim/*.dylib
 shim/build/
+.DS_Store

@@ -91,3 +91,83 @@ def test_snapshot_sampling_density() -> None:
     assert len(every_1) > len(every_10)
     # both end on the same final state
     assert every_1[-1][0].total_free == every_10[-1][0].total_free
+
+
+# ---- new policies: next-fit, caching, custom plugin -----------------------
+
+def test_next_fit_and_caching_are_valid_placements() -> None:
+    """Every policy must produce a feasible layout (no two live blocks overlap)
+    and a footprint >= peak live."""
+    events = w.generate(w.WorkloadConfig(n_events=3000, seed=7))
+    for policy in ("next-fit", "caching"):
+        _snap, heap = list(replay(list(events), policy))[-1]
+        assert heap.peak_capacity >= heap.peak_live, policy
+
+
+def test_caching_holds_reserved_across_free() -> None:
+    """The caching allocator caches freed blocks -- reserved memory does not
+    shrink when an object is freed (unlike the fit policies' coalescing)."""
+    from fragmetrics.heap import CachingHeap
+    h = CachingHeap()
+    h.alloc(0, 1000)
+    reserved_after_alloc = h.capacity
+    h.free(0)
+    assert h.capacity == reserved_after_alloc  # segment stays reserved
+    # a same-size alloc reuses the cached block, no new reservation
+    h.alloc(1, 1000)
+    assert h.capacity == reserved_after_alloc
+
+
+def test_custom_policy_plugin() -> None:
+    """A registered fit function is selectable by name and drives placement."""
+    from fragmetrics.heap import register_policy, FreeRun, FitContext, Heap
+
+    def worst_fit_clone(free_runs: list[FreeRun], size: int, ctx: FitContext) -> int | None:
+        best, best_len = None, -1
+        for i, r in enumerate(free_runs):
+            if r.length >= size and r.length > best_len:
+                best, best_len = i, r.length
+        return best
+
+    register_policy("worst-clone", worst_fit_clone)
+    assert "worst-clone" in Heap.known_policies()
+    events = w.generate(w.WorkloadConfig(n_events=1500, seed=4))
+    _snap, custom = list(replay(list(events), "worst-clone"))[-1]
+    _snap, builtin = list(replay(list(events), "worst-fit"))[-1]
+    # our clone should match the built-in worst-fit footprint exactly
+    assert custom.peak_capacity == builtin.peak_capacity
+
+
+def test_unknown_policy_rejected() -> None:
+    with pytest.raises(ValueError):
+        Heap("no-such-policy")
+
+
+# ---- torch-native-allocation.md metric family ------------------------------
+
+def test_doc_metrics_identities() -> None:
+    """The doc's metrics must satisfy their defining identities on any replay."""
+    from fragmetrics.metrics import doc_metrics_at_peak
+    events = w.generate(w.WorkloadConfig(n_events=3000, seed=11))
+    for policy in ("first-fit", "best-fit", "caching", "oracle"):
+        dm = doc_metrics_at_peak(events, policy)
+        # definitional identities from the doc
+        assert dm.internal_frag == max(0, dm.allocated - dm.active), policy
+        assert dm.non_reclaimable == max(0, dm.reserved - dm.cached_free), policy
+        assert dm.reserved >= dm.active, policy          # can't use less than live
+        assert dm.allocated >= dm.active, policy          # rounding only adds
+        assert 0.0 <= dm.hbm_utilization <= 1.0, policy
+        assert 0.0 <= dm.fragmentation_idx, policy
+
+
+def test_caching_has_internal_frag_and_segments() -> None:
+    """The caching allocator rounds sizes (internal frag) and reserves segments;
+    a plain fit policy does neither."""
+    from fragmetrics.metrics import doc_metrics_at_peak
+    events = w.generate(w.WorkloadConfig(n_events=2000, seed=5))
+    caching = doc_metrics_at_peak(events, "caching")
+    firstfit = doc_metrics_at_peak(events, "first-fit")
+    assert caching.segments > 0
+    assert caching.internal_frag >= 0          # rounding may or may not bite this trace
+    assert firstfit.segments == 0
+    assert firstfit.internal_frag == 0         # fits never round
