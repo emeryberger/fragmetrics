@@ -36,7 +36,7 @@ cmake --build build       # -> build/libfragtrace_alloc8.{dylib,so}
 ## Quick start: synthetic data
 
 ```bash
-# F(S) curve, MWF surface, timeseries, policy comparison, heap-layout strip
+# F(S) curve, windowed CDFs, timeseries, policy comparison, heap layout, spectrum
 python -m fragmetrics.cli run --synthetic random --n-events 10000 --seed 42 \
     --ignore-addresses \
     --policy first-fit --policy best-fit --policy worst-fit \
@@ -306,8 +306,9 @@ large_roundup=…, …)` — the defaults match the values derived in
 | | metric | what it captures | function |
 |---|---|---|---|
 | M1 | `F(S)` fragmentation-at-size | how many S-objects can fit vs ideal | `metrics.fragmentation_curve` |
-| M2 | spatial-MMU `MWF(W,S)` | worst window's usable fraction (address-space MMU) | `metrics.min_window_fill` |
-| M3 | P95/P99 window fill | robust (non-worst) percentile variant of M2 | `metrics.window_fill_percentile` |
+| M1b | usable-free curve | fraction of free bytes usable at size S: packed (`N(S)·S`) vs contiguous (free-extent survival); `.unusable` loss orientation | `metrics.usable_free_curve`, `pooled_usable_free_curve` |
+| M2 | occupancy CDF `O_W` | occupied fraction per window, as a full CDF; low tail = reclaimable (decommit/Mesh/huge-page) | `metrics.occupancy_distribution`, `pooled_occupancy`, `occupancy_spectrum` |
+| M3 | usability CDF `U_{W,S}` | fraction of each window's *free* bytes usable for size S (windowed UFSI complement) | `metrics.usability_distribution`, `pooled_usability` |
 | M4 | Gorman index `Fidx(S)` | capacity vs fragmentation discriminator | `metrics.fragmentation_index` |
 | M5 | blowup + ext-frag rate | peak heap / peak live; how often frag forces growth | `metrics.replay_blowup` |
 | M6 | checkerboard / Gini / entropy | cheap dashboard scalars | `metrics.summarize` |
@@ -331,10 +332,19 @@ All figures are publication-quality (seaborn, serif fonts, vector PDF/SVG output
 colorblind-safe palettes):
 
 1. **F(S) fragmentation curve** — log-x over size, one line per policy, P5–P95 band.
-2. **MWF(W,S) heatmap** — spatial-MMU surface (window length × object size).
+2. **Windowed CDFs** — M2 occupancy and M3 usability distributions, one curve
+   per window scale, pooled over the whole trace (byte-time weighting).
 3. **Fragmentation time series** — Fidx / checkerboard / occupancy over the replay.
 4. **Policy comparison bars** — blowup + AUC(F) per policy vs oracle.
 5. **Heap layout strip** — literal used/free address map over time.
+6. **Occupancy spectrum** — dispersion of pooled occupancy vs window scale per
+   policy: the collapse scale is the characteristic free-cluster size —
+   persistence to large W means big reclaimable gaps, early collapse means
+   diffuse waste needing relocation.
+7. **Unusable-free curve** — M1b in loss orientation: unusable fraction of
+   free byte-time vs request size, pooled over the trace and log-window
+   smoothed (pass `size_classes` for the operational steps-pre variant on an
+   allocator's own class grid).
 
 ---
 
@@ -369,7 +379,7 @@ python -m fragmetrics.cli run [OPTIONS]
   --synthetic NAME        fixture or 'random' (checkerboard|coalesced|capacity-exhaustion|random)
   --policy NAME           placement policy (repeatable): first-fit|best-fit|worst-fit|buddy|oracle
   --sizes N [N ...]       object sizes to probe (default: 16..4096 log-spaced)
-  --windows N [N ...]     window lengths for MWF (default: 256..65536)
+  --windows N [N ...]     window lengths W for the M2/M3 CDFs (default: 256..65536)
   --out DIR               write the figure catalogue here (PDF+SVG+PNG)
   --ignore-addresses      drop trace addresses; let --policy decide layout
   --n-events N            event count for --synthetic random (default: 10000)
@@ -429,7 +439,7 @@ relative to it.
 
 ```bash
 # Python
-pytest                        # 39 tests
+pytest                        # 64 tests
 mypy fragmetrics tests        # strict
 pyright                       # strict
 

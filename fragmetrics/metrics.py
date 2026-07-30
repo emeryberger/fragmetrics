@@ -3,13 +3,17 @@
 Every metric reads the same shared structure -- the coalesced free-run multiset
 of a :class:`~fragmetrics.heap.Snapshot` -- so a snapshot is summarized once and
 all metrics derive from it. The free-run lengths are lifted into a numpy array
-(``runs``) up front; the heavy metrics (F(S), MWF) are vectorized over it.
+(``runs``) up front; the heavy metrics (F(S), the windowed CDFs) are vectorized
+over it.
 
 Metrics
 -------
 M1  ``allocatable_count`` / ``fragmentation_at_size``   F(S), N(S)
-M2  ``min_window_fill``                                 spatial-MMU MWF(W,S)
-M3  ``window_fill_percentile`` + ``HeadroomSeries``     P95/P99 robust variants
+M1b ``usable_free_curve`` / ``pooled_usable_free_curve``
+    (+ ``.unusable`` loss orientation)                  usable-free curve
+M2  ``occupancy_distribution`` (+ ``pooled_occupancy``,
+    ``occupancy_spectrum``)                             occupancy CDF O_W
+M3  ``usability_distribution`` (+ ``pooled_usability``) usability CDF U_{W,S}
 M4  ``fragmentation_index``                             generalized Gorman Fidx(S)
 M5  ``BlowupResult`` (blowup, ext_growth_rate)          workload-coupled
 M6  ``checkerboard_index``, ``free_gini``, ``free_entropy``   cheap scalars
@@ -28,7 +32,7 @@ import numpy as np
 from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict
 
-from .heap import Heap, Snapshot
+from .heap import Heap, Snapshot, replay
 from .trace import Event, Op
 
 FloatArray = NDArray[np.float64]
@@ -99,24 +103,254 @@ def fragmentation_curve(snap: Snapshot, sizes: Sequence[int]) -> FragmentationCu
     )
 
 
-# --- M2/M3: spatial-MMU windowing and its robust percentile variants ------
+# --- M1b: usable-free curve over request size ------------------------------
+#
+# The byte-weighted companion to F(S): what fraction of the unallocated space
+# is actually usable at request size S? Two variants bracket the answer.
+# ``contiguous`` is the survival function of the byte-weighted free-extent
+# length distribution (monotone non-increasing, a true 1-CDF over S);
+# ``packed`` additionally charges the per-run packing loss of carving objects
+# of exactly S (floor(b/S)*S), so packed <= contiguous, with a sawtooth within
+# each octave. The gap between the two is pure packing loss; the cliff in
+# ``contiguous`` is the characteristic free-run size. ``packed`` equals the
+# byte-weighted mean of the M3 usability CDF at W >= capacity, and generalizes
+# Gorman's UFSI complement from powers of two to arbitrary S. (Objects of size
+# "<= S" would be degenerate -- tiny objects can always fill everything -- so
+# both variants carve at exactly S.)
 
 
-def _window_fills(snap: Snapshot, window: int, size: int) -> FloatArray:
-    """Per-window usable fraction u(win,S)/W for non-overlapping windows.
+def packed_usable_fraction(snap: Snapshot, size: int) -> float:
+    """Fraction of free bytes usable when carving size-S objects: N(S)*S/TotalFree."""
+    if size <= 0:
+        raise ValueError("size must be positive")
+    runs = _runs(snap)
+    total = runs.sum()
+    if total == 0:
+        return 0.0
+    return float((runs // size * size).sum() / total)
 
-    Usable bytes in a window = sum over free runs intersecting the window of
-    floor(intersection_len / size) * size. Windows tile [0, capacity); the
-    final short window is scaled by its actual length.
+
+def contiguous_free_fraction(snap: Snapshot, size: int) -> float:
+    """Fraction of free bytes in runs >= S: the free-extent survival function."""
+    if size <= 0:
+        raise ValueError("size must be positive")
+    runs = _runs(snap)
+    total = runs.sum()
+    if total == 0:
+        return 0.0
+    return float(runs[runs >= size].sum() / total)
+
+
+class UsableFreeCurve(BaseModel):
+    """packed/contiguous usable-free fractions sampled over request sizes."""
+
+    model_config = ConfigDict(frozen=True)
+
+    sizes: list[int]
+    packed: list[float]
+    contiguous: list[float]
+
+    @property
+    def unusable(self) -> list[float]:
+        """Loss orientation (UFSI-style): 1 - packed. Up = bad, 0 = perfect.
+
+        Preferred for presentation: it reads consistently with F(S) and the
+        Gorman indices, keeps the interesting region (a few percent loss) off
+        the axis ceiling, and admits a log scale.
+        """
+        return [1.0 - p for p in self.packed]
+
+    @property
+    def unusable_auc(self) -> float:
+        """Area under the unusable curve on a log-size axis, in [0, 1] --
+        the M1b scalar companion to ``FragmentationCurve.auc``."""
+        if len(self.sizes) < 2:
+            return 0.0
+        log_s = np.log(np.asarray(self.sizes, dtype=np.float64))
+        u = 1.0 - np.asarray(self.packed, dtype=np.float64)
+        return float(np.trapezoid(u, log_s) / (log_s[-1] - log_s[0]))
+
+
+def usable_free_curve(snap: Snapshot, sizes: Sequence[int]) -> UsableFreeCurve:
+    """M1b: the usable-free curve y(S) over ``sizes`` (see module comment)."""
+    return UsableFreeCurve(
+        sizes=list(sizes),
+        packed=[packed_usable_fraction(snap, s) for s in sizes],
+        contiguous=[contiguous_free_fraction(snap, s) for s in sizes],
+    )
+
+
+def pooled_usable_free_curve(
+    events: Sequence[Event], policy: str, sizes: Sequence[int], *, every: int = 1
+) -> UsableFreeCurve:
+    """Whole-trace M1b: fractions pooled over the replay, each snapshot
+    weighted by dwell time x free bytes. ``packed[j]`` reads "over the run,
+    this fraction of free byte-time was usable when carving size-S objects";
+    ``contiguous`` likewise for "sat in runs >= S"."""
+    snaps, dwell = _snapshot_dwell(events, policy, every)
+    sz = np.asarray(sizes, dtype=np.float64)
+    packed_num = np.zeros(len(sizes))
+    contig_num = np.zeros(len(sizes))
+    denom = 0.0
+    for snap, dt in zip(snaps, dwell):
+        runs = _runs(snap)
+        total = runs.sum()
+        weight = dt * total
+        if weight <= 0:
+            continue
+        denom += weight
+        cols = runs[:, None]
+        packed_num += weight * (np.floor(cols / sz) * sz).sum(axis=0) / total
+        contig_num += weight * np.where(cols >= sz, cols, 0.0).sum(axis=0) / total
+    if denom == 0:
+        zeros = [0.0] * len(sizes)
+        return UsableFreeCurve(sizes=list(sizes), packed=zeros, contiguous=list(zeros))
+    return UsableFreeCurve(
+        sizes=list(sizes),
+        packed=(packed_num / denom).tolist(),
+        contiguous=(contig_num / denom).tolist(),
+    )
+
+
+# --- M2/M3: windowed distributions (occupancy and usability CDFs) ---------
+#
+# The old MWF(W,S) = min over windows of usable_free/W conflated two opposite
+# conditions: a window with NO free space (healthy density) scored 0 exactly
+# like a window whose free space is shredded below S (pathology) -- a perfectly
+# compacted heap had MWF = 0. The redefinition splits the windowing idea into
+# two clean distributions over tiled windows, reported as full (weighted)
+# empirical CDFs rather than a single order statistic:
+#
+#   M2  occupancy_distribution(W)    value = occupied/W,      weight = W bytes
+#   M3  usability_distribution(W,S)  value = usable/free,     weight = free bytes
+#
+# Identities: the weighted mean of M2 is exactly global occupancy at every W;
+# the weighted mean of M3 at W >= capacity is exactly N(S)*S/TotalFree (the
+# complement of Gorman's unusable-free-space index). With dyadic windows, M2 at
+# scale 2W is the length-weighted mean of its two children, so its variance is
+# non-increasing in W -- the decay of spread with scale is the fragmentation
+# spectrum (see ``occupancy_spectrum``).
+
+
+class WindowDistribution(BaseModel):
+    """A byte-weighted empirical distribution over tiled address-space windows.
+
+    ``values`` are sorted ascending with aligned ``weights`` (bytes). The CDF is
+    F(u) = fraction of weight on windows with value <= u; ``quantile(0)`` is the
+    worst window (the old MMU-style min, now a derived view).
+
+    Caveat: free runs are clipped at window boundaries before ``floor(seg/S)``,
+    so a run straddling a boundary can undercount usable bytes in both windows.
+    The bias inflates the low tail as S approaches W; the mean identities above
+    are exact only at W >= capacity. Prefer W >> S when reading tails.
     """
-    if window <= 0 or size <= 0:
-        raise ValueError("window and size must be positive")
+
+    model_config = ConfigDict(frozen=True)
+
+    window: int
+    size: int | None = None  # set for usability distributions
+    values: list[float]
+    weights: list[float]
+
+    @property
+    def total_weight(self) -> float:
+        return float(sum(self.weights))
+
+    @property
+    def mean(self) -> float:
+        """Byte-weighted mean (0.0 for an empty distribution)."""
+        total = self.total_weight
+        if total == 0:
+            return 0.0
+        v = np.asarray(self.values)
+        w = np.asarray(self.weights)
+        return float((v * w).sum() / total)
+
+    @property
+    def std(self) -> float:
+        """Byte-weighted standard deviation (0.0 for an empty distribution)."""
+        total = self.total_weight
+        if total == 0:
+            return 0.0
+        v = np.asarray(self.values)
+        w = np.asarray(self.weights)
+        mu = (v * w).sum() / total
+        return float(math.sqrt(((v - mu) ** 2 * w).sum() / total))
+
+    def quantile(self, pct: float) -> float:
+        """Weighted quantile in [0, 100]. pct=0 is the worst window (old MWF min)."""
+        if not 0.0 <= pct <= 100.0:
+            raise ValueError("pct must be in [0, 100]")
+        if not self.values:
+            return 0.0
+        cw = np.cumsum(self.weights)
+        idx = int(np.searchsorted(cw, pct / 100.0 * cw[-1], side="left"))
+        return self.values[min(idx, len(self.values) - 1)]
+
+    def cdf_at(self, u: float) -> float:
+        """F(u): fraction of weight on windows with value <= u.
+
+        E.g. ``occupancy_distribution(snap, PAGE).cdf_at(0.5)`` is the fraction
+        of the heap sitting in pages at most half occupied -- the reclaim/Mesh
+        tail mass.
+        """
+        if not self.values:
+            return 0.0
+        idx = int(np.searchsorted(np.asarray(self.values), u, side="right"))
+        if idx == 0:
+            return 0.0
+        return float(np.cumsum(self.weights)[idx - 1] / self.total_weight)
+
+    @classmethod
+    def pool(
+        cls,
+        dists: Sequence["WindowDistribution"],
+        time_weights: Sequence[float] | None = None,
+    ) -> "WindowDistribution":
+        """Pool per-snapshot distributions into one, scaling each snapshot's
+        byte weights by its ``time_weights`` entry (e.g. event-clock dwell time).
+        The result is a distribution over (window, instant) samples: byte-time.
+        """
+        if time_weights is not None and len(time_weights) != len(dists):
+            raise ValueError("time_weights must align with dists")
+        kept = [
+            (d, 1.0 if time_weights is None else float(time_weights[i]))
+            for i, d in enumerate(dists)
+            if d.values and (time_weights is None or time_weights[i] > 0)
+        ]
+        if not kept:
+            base = dists[0] if dists else None
+            return cls(window=base.window if base else 0,
+                       size=base.size if base else None, values=[], weights=[])
+        window, size = kept[0][0].window, kept[0][0].size
+        if any(d.window != window or d.size != size for d, _ in kept):
+            raise ValueError("cannot pool distributions with differing window/size")
+        v = np.concatenate([np.asarray(d.values) for d, _ in kept])
+        w = np.concatenate([np.asarray(d.weights) * tw for d, tw in kept])
+        order = np.argsort(v, kind="stable")
+        return cls(window=window, size=size,
+                   values=v[order].tolist(), weights=w[order].tolist())
+
+
+def _window_profile(
+    snap: Snapshot, window: int, size: int | None
+) -> tuple[FloatArray, FloatArray, FloatArray]:
+    """Per tiled window: (length, free bytes, usable-for-size bytes) arrays.
+
+    Windows tile [0, capacity); the trailing window may be short. ``usable`` is
+    all-zero when ``size`` is None (occupancy only needs free bytes).
+    """
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if size is not None and size <= 0:
+        raise ValueError("size must be positive")
     if snap.capacity == 0:
-        return np.zeros(0, dtype=np.float64)
+        z = np.zeros(0, dtype=np.float64)
+        return z, z.copy(), z.copy()
     n_windows = math.ceil(snap.capacity / window)
+    free = np.zeros(n_windows, dtype=np.float64)
     usable = np.zeros(n_windows, dtype=np.float64)
     for run in snap.free_runs:
-        # distribute this run's usable bytes across the windows it spans
         first = run.start // window
         last = (run.end - 1) // window
         for w in range(first, last + 1):
@@ -124,33 +358,134 @@ def _window_fills(snap: Snapshot, window: int, size: int) -> FloatArray:
             hi = min(run.end, (w + 1) * window)
             seg = hi - lo
             if seg > 0:
-                usable[w] += (seg // size) * size
-    # denominator: full window length, except the trailing partial window
+                free[w] += seg
+                if size is not None:
+                    usable[w] += (seg // size) * size
     lengths = np.full(n_windows, float(window))
-    tail = snap.capacity - (n_windows - 1) * window
-    lengths[-1] = float(tail)
-    fills: FloatArray = usable / lengths
-    return fills
+    lengths[-1] = float(snap.capacity - (n_windows - 1) * window)
+    return lengths, free, usable
 
 
-def min_window_fill(snap: Snapshot, window: int, size: int) -> float:
-    """MWF(W,S): the minimum (worst) window's usable fraction -- the MMU analog."""
-    fills = _window_fills(snap, window, size)
-    return float(fills.min()) if fills.size else 0.0
+def _sorted_dist(
+    window: int, size: int | None, values: FloatArray, weights: FloatArray
+) -> WindowDistribution:
+    order = np.argsort(values, kind="stable")
+    return WindowDistribution(
+        window=window, size=size,
+        values=values[order].tolist(), weights=weights[order].tolist(),
+    )
 
 
-def window_fill_percentile(snap: Snapshot, window: int, size: int, pct: float) -> float:
-    """M3: low-tail percentile of per-window fill. pct=0 recovers MWF (the min).
+def occupancy_distribution(snap: Snapshot, window: int) -> WindowDistribution:
+    """M2: the occupancy CDF O_W -- occupied fraction per window, weighted by
+    window length. The spatial analog of MMU's mutator utilization.
 
-    P95-latency-style robustness: ``pct=1`` is the P1 (near-worst) window,
-    ``pct=5`` the P5, etc. Lower percentile = more pessimistic.
+    The low tail is the actionable part: nearly-empty windows are what decommit
+    (W = page) or huge-page demotion (W = 2 MiB) can reclaim, and bimodality at
+    page scale is the Mesh signal. The weighted mean equals global occupancy
+    ``used_bytes/capacity`` at every W. "Occupied" counts placed footprints
+    (buddy's rounding slack is occupied), matching the free-run structure.
     """
-    if not 0.0 <= pct <= 100.0:
-        raise ValueError("pct must be in [0, 100]")
-    fills = _window_fills(snap, window, size)
-    if fills.size == 0:
-        return 0.0
-    return float(np.percentile(fills, pct))
+    lengths, free, _ = _window_profile(snap, window, None)
+    if lengths.size == 0:
+        return WindowDistribution(window=window, values=[], weights=[])
+    occ: FloatArray = (lengths - free) / lengths
+    return _sorted_dist(window, None, occ, lengths)
+
+
+def usability_distribution(snap: Snapshot, window: int, size: int) -> WindowDistribution:
+    """M3: the usability CDF U_{W,S} -- per window, the fraction of its FREE
+    bytes usable for size-S objects (``sum floor(seg/S)*S / free``), weighted by
+    free bytes. Windows with no free space carry no weight.
+
+    This is a windowed, localized complement of Gorman's unusable-free-space
+    index: pure external fragmentation at S, with density factored out (which
+    the old MWF conflated). At W >= capacity the weighted mean is exactly
+    ``allocatable_count(snap, S) * S / total_free``.
+    """
+    _, free, usable = _window_profile(snap, window, size)
+    mask = free > 0
+    if not mask.any():
+        return WindowDistribution(window=window, size=size, values=[], weights=[])
+    frac: FloatArray = usable[mask] / free[mask]
+    return _sorted_dist(window, size, frac, free[mask])
+
+
+def _snapshot_dwell(events: Sequence[Event], policy: str, every: int) -> tuple[list[Snapshot], list[float]]:
+    """Replay and pair each sampled snapshot with its dwell time on the event
+    clock (ts delta to the next sample; the final sample gets weight 1)."""
+    snaps = [snap for snap, _ in replay(list(events), policy, snapshot_every=every)]
+    dwell = [float(b.ts - a.ts) for a, b in zip(snaps, snaps[1:])] + [1.0]
+    return snaps, dwell
+
+
+def pooled_occupancy(
+    events: Sequence[Event], policy: str, window: int, *, every: int = 1
+) -> WindowDistribution:
+    """Whole-trace M2: occupancy CDF pooled over the replay, each snapshot
+    weighted by its dwell time on the event clock -- byte-time, so transient
+    states count in proportion to how long they persisted. ``cdf_at(u)`` then
+    reads "this fraction of heap byte-time sat at occupancy <= u"."""
+    snaps, dwell = _snapshot_dwell(events, policy, every)
+    return WindowDistribution.pool(
+        [occupancy_distribution(s, window) for s in snaps], dwell
+    )
+
+
+def pooled_usability(
+    events: Sequence[Event], policy: str, window: int, size: int, *, every: int = 1
+) -> WindowDistribution:
+    """Whole-trace M3: usability CDF pooled over the replay (see pooled_occupancy)."""
+    snaps, dwell = _snapshot_dwell(events, policy, every)
+    return WindowDistribution.pool(
+        [usability_distribution(s, window, size) for s in snaps], dwell
+    )
+
+
+class OccupancySpectrum(BaseModel):
+    """Dispersion of the occupancy distribution as a function of window scale.
+
+    With dyadic windows, occupancy at 2W averages its two children, so ``std``
+    is non-increasing in W per snapshot, and the scale at which the spread
+    collapses reads off the characteristic size of contiguous used/free
+    clusters. Spread persisting at W means whole W-windows sit empty --
+    reclaimable at that granularity (a compacted heap with slack keeps std at
+    its maximum almost to the heap size); early collapse means free space is
+    diffuse below that scale and needs relocation to recover.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    windows: list[int]
+    mean: list[float]
+    std: list[float]
+
+
+def occupancy_spectrum(
+    events: Sequence[Event], policy: str, windows: Sequence[int], *, every: int = 1
+) -> OccupancySpectrum:
+    """The fragmentation spectrum: whole-trace pooled occupancy mean/std per W."""
+    snaps, dwell = _snapshot_dwell(events, policy, every)
+    means: list[float] = []
+    stds: list[float] = []
+    for w in windows:
+        pooled = WindowDistribution.pool(
+            [occupancy_distribution(s, w) for s in snaps], dwell
+        )
+        means.append(pooled.mean)
+        stds.append(pooled.std)
+    return OccupancySpectrum(windows=list(windows), mean=means, std=stds)
+
+
+def dyadic_windows(capacity: int, *, min_window: int = 256) -> list[int]:
+    """Power-of-two window lengths from ``min_window`` up to >= capacity --
+    the scales at which the occupancy spectrum's variance decay is exact."""
+    if min_window <= 0:
+        raise ValueError("min_window must be positive")
+    windows = [min_window]
+    while windows[-1] < capacity:
+        windows.append(windows[-1] * 2)
+    return windows
 
 
 # --- M4: generalized Gorman fragmentation index ---------------------------
