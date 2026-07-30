@@ -212,6 +212,65 @@ def pooled_usable_free_curve(
     )
 
 
+# --- M1c: workload-coupled expected unusable fraction ----------------------
+#
+# ``unusable_auc`` weights request sizes log-uniformly over [lo, hi] -- a
+# workload-agnostic prior. M1c replaces that prior with the trace's OWN
+# empirical request-size distribution: the expected unusable fraction of free
+# byte-time for a request actually drawn from this workload. This is the
+# distributional generalization of M5's ext_growth_rate (which counts the
+# realized contiguous-variant failures over the request stream).
+
+
+class WorkloadUnusable(BaseModel):
+    """Pooled unusable fractions evaluated at the workload's own sizes."""
+
+    model_config = ConfigDict(frozen=True)
+
+    sizes: list[int]                 # unique request sizes, ascending
+    probs: list[float]               # empirical request frequencies (sum to 1)
+    unusable: list[float]            # pooled packed-unusable at each size
+    contiguous_unusable: list[float]
+
+    @property
+    def expected(self) -> float:
+        """E[unusable(S)] over the workload's request-size distribution."""
+        return float(np.dot(self.probs, self.unusable)) if self.sizes else 0.0
+
+    @property
+    def expected_contiguous(self) -> float:
+        """Contiguous variant: expected fraction of free byte-time in runs < S."""
+        return float(np.dot(self.probs, self.contiguous_unusable)) if self.sizes else 0.0
+
+
+def request_size_distribution(events: Sequence[Event]) -> tuple[list[int], list[float]]:
+    """Empirical request-size distribution over a trace's alloc events
+    (request-weighted: each allocation counts once)."""
+    sizes = [ev.size for ev in events if ev.op is Op.ALLOC and ev.size is not None]
+    if not sizes:
+        return [], []
+    uniq, counts = np.unique(np.asarray(sizes, dtype=np.int64), return_counts=True)
+    return [int(s) for s in uniq], (counts / counts.sum()).tolist()
+
+
+def workload_expected_unusable(
+    events: Sequence[Event], policy: str, *, every: int = 1
+) -> WorkloadUnusable:
+    """M1c: the pooled unusable-free curve weighted by the trace's own request
+    sizes. ``.expected`` reads "the expected fraction of free byte-time that is
+    unusable for a request drawn at random from this workload"."""
+    sizes, probs = request_size_distribution(events)
+    if not sizes:
+        return WorkloadUnusable(sizes=[], probs=[], unusable=[], contiguous_unusable=[])
+    curve = pooled_usable_free_curve(events, policy, sizes, every=every)
+    return WorkloadUnusable(
+        sizes=sizes,
+        probs=probs,
+        unusable=curve.unusable,
+        contiguous_unusable=[1.0 - c for c in curve.contiguous],
+    )
+
+
 # --- M2/M3: windowed distributions (occupancy and usability CDFs) ---------
 #
 # The old MWF(W,S) = min over windows of usable_free/W conflated two opposite

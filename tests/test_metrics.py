@@ -205,6 +205,31 @@ def test_packed_bounded_by_contiguous_and_matches_m3_mean() -> None:
     assert curve.contiguous == sorted(curve.contiguous, reverse=True)
 
 
+# --- M1c: workload-coupled expected unusable ------------------------------
+
+
+def test_request_size_distribution_is_normalized() -> None:
+    events = [e.model_copy(update={"addr": None}) for e in w.generate(w.WorkloadConfig(n_events=500, seed=3))]
+    sizes, probs = m.request_size_distribution(events)
+    assert sizes == sorted(sizes)
+    assert sum(probs) == pytest.approx(1.0)
+
+
+def test_workload_expected_unusable_single_size() -> None:
+    # checkerboard trace: every request is one 64 B block, and the surviving
+    # free runs are exactly 64 B -- the workload's own requests always fit
+    events = w.checkerboard(block=64, n=16)
+    wu = m.workload_expected_unusable(events, "first-fit")
+    assert wu.sizes == [64]
+    assert wu.probs == [1.0]
+    assert wu.expected == pytest.approx(wu.unusable[0])
+    assert wu.expected < 0.05
+    # a hypothetical doubled request against the same replay would starve;
+    # the workload-coupled scalar correctly reports near-zero instead
+    curve = m.pooled_usable_free_curve(events, "first-fit", [128])
+    assert curve.unusable[0] > wu.expected
+
+
 # --- WindowDistribution mechanics + whole-trace pooling -------------------
 
 

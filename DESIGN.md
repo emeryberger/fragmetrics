@@ -98,6 +98,20 @@ classes rounds UP, and for a size-class allocator, off-grid packing loss is
 internal fragmentation already counted elsewhere, so the class grid avoids
 double-counting.
 
+**M1c — workload-coupled expected unusable**
+*(`metrics.workload_expected_unusable`, `request_size_distribution`)*: replace
+`unusable_auc`'s log-uniform size prior with the trace's **own empirical
+request-size distribution**: `E[unusable(S)]` for a request actually drawn
+from this workload — "the expected fraction of free byte-time unusable for the
+next request." The distributional generalization of M5's `ext_growth_rate`
+(which counts the realized contiguous-variant failures). Measured on the
+mixture workload, it runs 5–20× *below* the log-uniform AUC: replay-freed
+blocks are themselves request-sized, so the free-extent distribution
+self-matches the request mix, and the log-uniform prior spends most of its
+mass in octaves where no requests occur. Report both: `E` is the fragmentation
+the workload experiences; `AUC` is a stress number for distribution shift
+(what if tomorrow's requests are bigger).
+
 ### M2 — Occupancy CDF `O_W`
 *(`metrics.occupancy_distribution`, `pooled_occupancy`, `occupancy_spectrum`)*
 

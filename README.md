@@ -307,6 +307,7 @@ large_roundup=…, …)` — the defaults match the values derived in
 |---|---|---|---|
 | M1 | `F(S)` fragmentation-at-size | how many S-objects can fit vs ideal | `metrics.fragmentation_curve` |
 | M1b | usable-free curve | fraction of free bytes usable at size S: packed (`N(S)·S`) vs contiguous (free-extent survival); `.unusable` loss orientation | `metrics.usable_free_curve`, `pooled_usable_free_curve` |
+| M1c | workload-coupled E[unusable] | expected unusable fraction of free byte-time for a request drawn from the trace's own size distribution | `metrics.workload_expected_unusable` |
 | M2 | occupancy CDF `O_W` | occupied fraction per window, as a full CDF; low tail = reclaimable (decommit/Mesh/huge-page) | `metrics.occupancy_distribution`, `pooled_occupancy`, `occupancy_spectrum` |
 | M3 | usability CDF `U_{W,S}` | fraction of each window's *free* bytes usable for size S (windowed UFSI complement) | `metrics.usability_distribution`, `pooled_usability` |
 | M4 | Gorman index `Fidx(S)` | capacity vs fragmentation discriminator | `metrics.fragmentation_index` |
