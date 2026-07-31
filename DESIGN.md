@@ -17,7 +17,8 @@ This package proposes a small **family of metrics** that are:
   (compaction oracle) allocator replaying the *same* trace.
 
 No single scalar carries all three properties, so the design is a few **curves**
-(`F(S)`, the `MWF(W,S)` surface) plus collapsed scalars for dashboards.
+(`F(S)`; the windowed occupancy/usability CDFs `O_W` and `U_{W,S}`; the
+occupancy spectrum over scales) plus collapsed scalars for dashboards.
 
 ---
 
@@ -69,28 +70,104 @@ F(S)  = 1 − N(S)/N*(S)  ∈ [0,1)  0 = no external fragmentation at S
 (`FragmentationCurve.auc`) is a single scalar summary. When `N*(S)=0` (the ideal
 heap cannot hold even one), `F(S)≡0` — that is a *capacity* limit, deferred to M4.
 
-### M2 — Spatial-MMU `MWF(W,S)` *(`metrics.min_window_fill`)*
+**M1b — usable-free curve** *(`metrics.usable_free_curve`,
+`packed_usable_fraction`, `contiguous_free_fraction`)*: the byte-weighted
+companion — what fraction of unallocated space is usable at request size `S`?
+Two variants bracket it: `packed = N(S)·S/TotalFree` (charges per-run packing
+loss; sawtooth within octaves, non-monotone — a 32 KiB gap serves one 32 KiB
+object perfectly but strands ~half of itself against a 20 KiB one) and
+`contiguous = Σ_{bᵢ≥S} bᵢ/TotalFree` (the survival function of the
+byte-weighted free-extent length distribution; monotone, a true `1−CDF` over
+`S`, and an upper bound on `packed`). The `contiguous` cliff sits at the
+characteristic free-run size — the size-domain dual of the occupancy spectrum's
+collapse scale — and `packed` equals the byte-weighted mean of M3 at
+`W ≥ capacity`, generalizing Gorman's UFSI complement to arbitrary `S`.
+(Carving objects "≤ S" would be degenerate — tiny objects fill anything — so
+both variants carve at exactly `S`.)
 
-The user's windowing idea, formalized over the **address space** instead of time.
-Tile the heap with windows of length `W`; per window, usable bytes for size `S`
-are `Σ floor(seg/S)·S` over the free segments in that window:
+Presentation conventions, chosen after comparing the options on canonical
+layouts: report the **loss orientation** (`.unusable = 1 − packed`, up = bad),
+which matches F(S)/UFSI, keeps few-percent losses visible off the axis
+ceiling, and admits a log scale; `unusable_auc` is the scalar companion to
+`AUC(F)`. `pooled_usable_free_curve` gives the whole-trace version (dwell ×
+free-bytes weighting: unusable fraction of free *byte-time*). For rendering,
+either smooth over a log-S window (the expected loss for a request near `S`;
+bandwidth is the continuous analog of size-class granularity), or evaluate on
+the allocator's own size-class grid drawn *steps-pre* — a request between
+classes rounds UP, and for a size-class allocator, off-grid packing loss is
+internal fragmentation already counted elsewhere, so the class grid avoids
+double-counting.
+
+**M1c — workload-coupled expected unusable**
+*(`metrics.workload_expected_unusable`, `request_size_distribution`)*: replace
+`unusable_auc`'s log-uniform size prior with the trace's **own empirical
+request-size distribution**: `E[unusable(S)]` for a request actually drawn
+from this workload — "the expected fraction of free byte-time unusable for the
+next request." The distributional generalization of M5's `ext_growth_rate`
+(which counts the realized contiguous-variant failures). Measured on the
+mixture workload, it runs 5–20× *below* the log-uniform AUC: replay-freed
+blocks are themselves request-sized, so the free-extent distribution
+self-matches the request mix, and the log-uniform prior spends most of its
+mass in octaves where no requests occur. Report both: `E` is the fragmentation
+the workload experiences; `AUC` is a stress number for distribution shift
+(what if tomorrow's requests are bigger).
+
+### M2 — Occupancy CDF `O_W`
+*(`metrics.occupancy_distribution`, `pooled_occupancy`, `occupancy_spectrum`)*
+
+The windowing idea (MMU adapted from time to address space), redefined as a
+full **distribution** rather than an order statistic. Tile the heap with
+windows of length `W`; per window record the occupied fraction, weighted by
+window length:
 
 ```
-MWF(W,S) = min over windows  usable(win,S) / W      MMU analog
+O_W(u) = fraction of heap bytes in windows with occupancy ≤ u
 ```
 
-Small `W` exposes local fragmentation hotspots (where the next big alloc dies);
-large `W` averages toward the global ratio. Fixing `S` gives a 2-D curve over `W`;
-the full `(W,S)` grid is a heatmap.
+- **Exact identity:** the weighted mean equals global occupancy at *every* `W`
+  — all the fragmentation information is in the *shape*, not the mean.
+- **Low tail is actionable:** mass near 0 at `W` = page is what decommit /
+  `madvise` reclaims; at `W` = 2 MiB it is huge-page bloat; *bimodality* at
+  page scale is the Mesh signal.
+- **Multiresolution structure:** with dyadic windows, occupancy at `2W` is the
+  mean of its two children, so variance is non-increasing in `W` (a martingale
+  coarsening; `O_W` collapses to a point mass at global occupancy as `W` → heap
+  size). The decay of spread with scale — `occupancy_spectrum` — is the
+  **fragmentation spectrum**: the collapse scale reads off the characteristic
+  size of contiguous free/used clusters. Spread *persisting* at `W` means whole
+  `W`-windows sit empty — reclaimable at that granularity (a compacted heap
+  with slack keeps std ≈ 0.5 almost to the heap size); *early collapse* means
+  free space is shredded below that scale and needs relocation to recover.
+- **Whole-trace:** `pooled_occupancy` pools every replay snapshot weighted by
+  its dwell time on the event clock (byte-time), so transient fragmentation
+  counts in proportion to how long it persisted.
 
-### M3 — Robust P95/P99 variants *(`metrics.window_fill_percentile`)*
+**Why not the min (the original MMU transfer):** the previous
+`MWF(W,S) = min over windows of usable_free/W` conflated a fully-live window
+(healthy density) with a shredded one (pathology) — a perfectly compacted heap
+scored `MWF = 0`. And unlike MMU's time axis, where one bad window breaks a
+real-time deadline, no consumer exists for the worst *spatial* window (an
+allocation need not be satisfied in any particular window), so the min is
+degenerate: the distribution is where the information lives. The min and any
+percentile remain derived views: `dist.quantile(0)` / `dist.quantile(p)`.
 
-MMU is the **min** (worst window) — brittle, like reporting max latency. The
-robust analog replaces the min with a low-tail percentile:
+### M3 — Usability CDF `U_{W,S}` *(`metrics.usability_distribution`, `pooled_usability`)*
+
+The external-fragmentation half of the old MWF, with density factored out. Per
+window, the fraction of its **free** bytes usable for size-`S` objects
+(`Σ floor(seg/S)·S / free`), weighted by free bytes (windows with no free space
+carry no weight):
 
 ```
-MWF_p(W,S) = p-th percentile of per-window usable fraction   (pct=0 ⇒ MMU)
+U_{W,S}(u) = fraction of free bytes in windows with usability ≤ u
 ```
+
+This is a *windowed, localized* complement of Gorman's UFSI: at `W` ≥ capacity
+the weighted mean is exactly `N(S)·S / TotalFree`. The low tail is free space
+shredded below `S` — pure external fragmentation at `S`, undiluted by dense
+regions. Caveat: free runs are clipped at window boundaries before
+`floor(seg/S)`, which inflates the low tail as `S` approaches `W`; read tails
+at `W ≫ S`. `pooled_usability` gives the byte-time whole-trace version.
 
 Also supported conceptually (replay-driven): per-request **headroom percentiles**
 (`MaxFree − sᵢ` over the request stream) and a **safe-allocatable size** — the
@@ -129,8 +206,9 @@ compaction **oracle** (blowup ≡ 1.0 by construction).
   `log₂ k` = k equal runs).
 - `MaxFree/TotalFree`, plus legacy occupancy for side-by-side comparison.
 
-**Headline set:** the `F(S)` curve and `MWF_p(W,S)` surface as analytical objects;
-`{AUC(F), safe-allocatable-size@P99, blowup, ext_growth_rate}` as tracked scalars.
+**Headline set:** the `F(S)` curve, the `O_W`/`U_{W,S}` CDF families, and the
+occupancy spectrum as analytical objects; `{AUC(F), safe-allocatable-size@P99,
+blowup, ext_growth_rate}` as tracked scalars.
 
 ---
 
@@ -178,18 +256,24 @@ Typing: fully annotated; passes `mypy --strict` and `pyright` (strict) cleanly.
 
 ### Figure catalogue (`report.py`)
 1. `F(S)` fragmentation curve with P5–P95 band, one line per policy (headline).
-2. `MWF(W,S)` heatmap (window × size); P-percentile variant via `pct`.
+2. `O_W` and `U_{W,S}` CDF families, one curve per window scale, pooled over
+   the whole trace (byte-time weighting).
 3. Fragmentation time series (safe-size / Fidx / checkerboard / occupancy).
 4. Allocator-comparison bars (blowup, AUC(F)) vs the oracle.
 5. Heap-layout strip — the literal used/free address map that makes the
    checkerboard visually unmistakable.
+6. Occupancy spectrum — dispersion of pooled occupancy vs window scale, one
+   line per policy (dyadic scales; concentrated vs diffuse waste).
+7. Unusable-free curve (M1b, loss orientation) — unusable fraction of free
+   byte-time vs request size, log-window smoothed (or on a size-class grid).
 
 ---
 
 ## Verification
 
-- `pytest` — 34 tests: golden (coalesced/checkerboard/capacity), windowing,
-  blowup ordering, M6 scalars, trace round-trip, figure smoke test.
+- `pytest` — 64 tests: golden (coalesced/checkerboard/capacity), windowed-CDF
+  identities (mean invariance, variance decay, UFSI complement), blowup
+  ordering, M6 scalars, trace round-trip, figure smoke test.
 - `python -m mypy fragmetrics tests` and `pyright` — clean under strict mode.
 - `python -m fragmetrics.cli run --synthetic checkerboard --policy first-fit`
   emits the scalar table; add `--out DIR` for the figure catalogue.

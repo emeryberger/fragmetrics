@@ -95,12 +95,28 @@ def _cmd_run(args: argparse.Namespace) -> int:
         events_by_policy = {p: events for p in policies}
         report.save_figure(report.plot_fragmentation_curve(events_by_policy, sizes), out / "f1_fragmentation_curve")
         primary = policies[0]
+        probe = sizes[len(sizes) // 2]
         final = [snap for snap, _ in replay(list(events), primary)][-1]
-        report.save_figure(report.plot_mwf_surface(final, windows, sizes), out / "f2_mwf_surface")
-        report.save_figure(report.plot_timeseries(events, primary, sizes[len(sizes) // 2]), out / "f3_timeseries")
+        # sample the replay so whole-trace pooling stays cheap on large traces
+        every = max(1, len(events) // 200)
+        report.save_figure(
+            report.plot_window_cdfs(events, primary, windows, probe, every=every),
+            out / "f2_window_cdfs",
+        )
+        report.save_figure(report.plot_timeseries(events, primary, probe), out / "f3_timeseries")
         report.save_figure(report.plot_policy_comparison(events_by_policy, sizes), out / "f4_policy_comparison")
         snaps = [snap for snap, _ in replay(list(events), primary)]
         report.save_figure(report.plot_heap_layout(snaps), out / "f5_heap_layout")
+        # dyadic scales make the spectrum's variance decay exact
+        spectrum_windows = m.dyadic_windows(final.capacity, min_window=min(windows))
+        report.save_figure(
+            report.plot_occupancy_spectrum(events_by_policy, spectrum_windows, every=every),
+            out / "f6_occupancy_spectrum",
+        )
+        report.save_figure(
+            report.plot_unusable_curve(events_by_policy, every=every),
+            out / "f7_unusable_curve",
+        )
         sys.stderr.write(f"figures written to {out}/\n")
     return 0
 
@@ -322,7 +338,8 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--synthetic", type=str, help="fixture name or 'random'")
     run.add_argument("--policy", action="append", default=[], help="placement policy (repeatable)")
     run.add_argument("--sizes", type=int, nargs="+", help="object sizes to probe")
-    run.add_argument("--windows", type=int, nargs="+", help="window lengths for MWF")
+    run.add_argument("--windows", type=int, nargs="+",
+                     help="window lengths W for the M2/M3 occupancy/usability CDFs")
     run.add_argument("--out", type=str, help="directory for output figures")
     run.add_argument("--n-events", type=int, default=10_000, help="events for --synthetic random")
     run.add_argument("--seed", type=int, default=0, help="seed for --synthetic random")

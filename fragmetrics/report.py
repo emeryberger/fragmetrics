@@ -5,10 +5,16 @@ The figure catalogue (each a standalone function returning a ``matplotlib``
 
 1. ``plot_fragmentation_curve``  -- F(S) over size, one line per policy, with a
    P5-P95 band across snapshots. The headline figure.
-2. ``plot_mwf_surface``          -- MWF(W,S) heatmap (window x size).
+2. ``plot_window_cdfs``          -- M2 occupancy and M3 usability CDFs, one
+   curve per window scale W.
 3. ``plot_timeseries``           -- safe-size@P99 / ext-frag / occupancy vs time.
 4. ``plot_policy_comparison``    -- blowup + AUC(F) bars per policy vs oracle.
 5. ``plot_heap_layout``          -- literal used/free address strip(s) over time.
+6. ``plot_occupancy_spectrum``   -- dispersion of whole-trace pooled occupancy
+   vs window scale, one line per policy (the fragmentation spectrum).
+7. ``plot_unusable_curve``       -- M1b in loss orientation: unusable fraction
+   of free byte-time vs request size, continuous (log-window smoothed) or on
+   a size-class grid.
 
 ``save_all`` renders the whole catalogue for a workload to PDF+SVG+PNG.
 """
@@ -19,6 +25,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import numpy as np
+from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from numpy.typing import NDArray
 
@@ -88,36 +95,85 @@ def plot_fragmentation_curve(
     return fig
 
 
-def plot_mwf_surface(
-    snap: Snapshot,
+def _draw_cdf(ax: Axes, dist: m.WindowDistribution, color: str, label: str) -> None:
+    """Draw one weighted empirical CDF as a step curve from (0,0) to (1,1)."""
+    if not dist.values:
+        return
+    w = np.asarray(dist.weights)
+    xs = np.concatenate([[0.0], np.asarray(dist.values), [1.0]])
+    ys = np.concatenate([[0.0], np.cumsum(w) / w.sum(), [1.0]])
+    ax.plot(xs, ys, drawstyle="steps-post", color=color, lw=1.5, label=label)
+
+
+def plot_window_cdfs(
+    events: Sequence[Event],
+    policy: str,
     windows: Sequence[int],
-    sizes: Sequence[int],
+    size: int,
     *,
-    pct: float = 0.0,
+    every: int = 1,
 ) -> Figure:
-    """Figure 2: MWF(W,S) heatmap. ``pct``>0 plots the percentile variant."""
-    grid = np.array(
-        [
-            [
-                m.window_fill_percentile(snap, w, s, pct) if pct > 0 else m.min_window_fill(snap, w, s)
-                for s in sizes
-            ]
-            for w in windows
-        ],
-        dtype=np.float64,
-    )
-    fig = Figure(figsize=(style.COLUMN_WIDTH * 1.5, style.COLUMN_WIDTH))
+    """Figure 2: whole-trace pooled M2/M3 distributions, one CDF per scale.
+
+    Each curve pools every replay snapshot weighted by its dwell time (byte-
+    time), so transient states count in proportion to how long they persisted
+    -- an end-of-trace or peak snapshot alone would misrepresent the run.
+    Left: occupancy CDF O_W -- the low tail is reclaimable space (decommit at
+    page W, Mesh when bimodal). Right: usability CDF U_{W,S} at the probe size
+    -- the low tail is free space shredded below S (external fragmentation with
+    density factored out).
+    """
+    fig = Figure(figsize=(style.DOUBLE_COLUMN_WIDTH, style.COLUMN_WIDTH))
+    ax_o, ax_u = fig.subplots(1, 2)
+    palette = style.OKABE_ITO
+    for i, w in enumerate(windows):
+        color = palette[i % len(palette)]
+        _draw_cdf(ax_o, m.pooled_occupancy(events, policy, w, every=every),
+                  color, f"$W$={w}")
+        _draw_cdf(ax_u, m.pooled_usability(events, policy, w, size, every=every),
+                  color, f"$W$={w}")
+    ax_o.set_xlabel("window occupancy $u$")
+    ax_o.set_ylabel(r"fraction of heap byte-time with occupancy $\leq u$")
+    ax_o.set_title("M2: occupancy CDF $O_W$")
+    ax_u.set_xlabel(f"usable fraction of free bytes ($S$={size})")
+    ax_u.set_ylabel(r"fraction of free byte-time with usability $\leq u$")
+    ax_u.set_title(r"M3: usability CDF $U_{W,S}$")
+    for ax in (ax_o, ax_u):
+        ax.set_xlim(-0.02, 1.02)
+        ax.set_ylim(-0.02, 1.02)
+        ax.legend(frameon=False, loc="upper left", fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
+def plot_occupancy_spectrum(
+    events_by_policy: Mapping[str, Sequence[Event]],
+    windows: Sequence[int],
+    *,
+    every: int = 1,
+) -> Figure:
+    """Figure 6: the fragmentation spectrum -- dispersion (weighted std) of the
+    whole-trace pooled occupancy distribution vs window scale, per policy.
+
+    The scale where a curve collapses is that policy's characteristic
+    free-cluster size: staying high out to large W = free space concentrated in
+    large contiguous gaps, reclaimable at that granularity (the compaction
+    oracle is the extreme case); collapsing early = free space diffuse below
+    that scale, needing relocation to recover. Dyadic ``windows`` make the
+    non-increasing decay exact per snapshot.
+    """
+    fig = Figure(figsize=(style.COLUMN_WIDTH * 1.4, style.COLUMN_WIDTH))
     ax = fig.subplots()
-    im = ax.imshow(grid, aspect="auto", origin="lower", cmap="crest", vmin=0.0, vmax=1.0)
-    ax.set_xticks(range(len(sizes)))
-    ax.set_xticklabels([str(s) for s in sizes], rotation=45, ha="right")
-    ax.set_yticks(range(len(windows)))
-    ax.set_yticklabels([str(w) for w in windows])
-    ax.set_xlabel("object size $S$ (bytes)")
-    ax.set_ylabel("window length $W$ (bytes)")
-    label = f"P{pct:g} window fill" if pct > 0 else "min window fill (MMU)"
-    ax.set_title(rf"Spatial-MMU surface: $MWF(W,S)$ — {label}")
-    fig.colorbar(im, ax=ax, label="usable fraction")
+    palette = style.OKABE_ITO
+    for i, (policy, events) in enumerate(events_by_policy.items()):
+        spec = m.occupancy_spectrum(events, policy, windows, every=every)
+        ax.plot(spec.windows, spec.std, color=palette[i % len(palette)],
+                lw=1.6, marker="o", ms=3, label=policy)
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("window length $W$ (bytes)")
+    ax.set_ylabel("weighted std of pooled occupancy")
+    ax.set_title("Fragmentation spectrum: occupancy dispersion vs scale")
+    ax.legend(frameon=False)
     return fig
 
 
@@ -192,6 +248,74 @@ def plot_heap_layout(snaps: Sequence[Snapshot], *, max_strips: int = 6) -> Figur
     axes[-1].set_xlabel("address (bytes) — orange = used, blue = free")
     fig.suptitle("Heap layout over time", y=0.99)
     fig.tight_layout()
+    return fig
+
+
+def _log_smooth(values: FloatArray, octaves_per_sample: float, bandwidth_octaves: float) -> FloatArray:
+    """Boxcar average over a log-S window of ``bandwidth_octaves`` -- the
+    expected value for a request drawn log-uniformly within +/- B/2 octaves."""
+    k = max(1, int(round(bandwidth_octaves / octaves_per_sample)))
+    if k % 2 == 0:
+        k += 1
+    kernel = np.full(k, 1.0 / k)
+    return np.convolve(np.pad(values, k // 2, mode="edge"), kernel, mode="valid").astype(np.float64)
+
+
+def plot_unusable_curve(
+    events_by_policy: Mapping[str, Sequence[Event]],
+    *,
+    size_classes: Sequence[int] | None = None,
+    bandwidth_octaves: float = 1.0,
+    lo: int = 64,
+    samples: int = 512,
+    every: int = 1,
+) -> Figure:
+    """Figure 7: M1b in loss orientation -- unusable fraction of free byte-time
+    at request size S, pooled over the whole trace, one curve per policy.
+
+    Default rendering is continuous: a dense log-spaced grid smoothed over
+    ``bandwidth_octaves`` (the expected loss for a request near S; the raw
+    sawtooth is drawn faintly behind). Passing ``size_classes`` switches to the
+    operational variant: exact values on the allocator's own class grid, drawn
+    steps-pre because a request between classes rounds UP to the next class.
+    """
+    fig = Figure(figsize=(style.COLUMN_WIDTH * 1.5, style.COLUMN_WIDTH))
+    ax = fig.subplots()
+    palette = style.OKABE_ITO
+
+    if size_classes is not None:
+        grid = sorted(size_classes)
+        for i, (policy, events) in enumerate(events_by_policy.items()):
+            curve = m.pooled_usable_free_curve(events, policy, grid, every=every)
+            ax.plot(grid, curve.unusable, color=palette[i % len(palette)], lw=1.6,
+                    marker="o", ms=3, drawstyle="steps-pre",
+                    label=f"{policy} (AUC={curve.unusable_auc:.2f})")
+    else:
+        # common grid across policies: up to the largest heap any policy grew
+        hi = lo * 2
+        for policy, events in events_by_policy.items():
+            final = [s for s, _ in replay(list(events), policy, snapshot_every=0)][-1]
+            hi = max(hi, final.capacity)
+        xs = np.exp(np.linspace(np.log(lo), np.log(hi), samples))
+        octaves_per_sample = float(np.log2(hi / lo) / (samples - 1))
+        sizes = [int(s) for s in xs]
+        for i, (policy, events) in enumerate(events_by_policy.items()):
+            curve = m.pooled_usable_free_curve(events, policy, sizes, every=every)
+            raw = np.asarray(curve.unusable)
+            color = palette[i % len(palette)]
+            ax.plot(xs, raw, color=color, lw=0.6, alpha=0.18)
+            ax.plot(xs, _log_smooth(raw, octaves_per_sample, bandwidth_octaves),
+                    color=color, lw=1.6,
+                    label=f"{policy} (AUC={curve.unusable_auc:.2f})")
+
+    ax.set_xscale("log", base=2)
+    ax.set_ylim(-0.03, 1.06)
+    ax.set_xlabel("request size $S$ (bytes)")
+    ax.set_ylabel("unusable fraction of free space (byte-time)")
+    label = ("on size-class grid" if size_classes is not None
+             else f"log-window smoothed ({bandwidth_octaves:g} octave)")
+    ax.set_title(f"Unusable-free curve — {label}")
+    ax.legend(frameon=False, loc="upper left", fontsize=8)
     return fig
 
 
